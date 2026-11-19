@@ -13,7 +13,7 @@
 [![Pre-encoded data](https://img.shields.io/badge/%F0%9F%A4%97-Pre--encoded%20data-ffcc4d.svg)](https://huggingface.co/datasets/yuzhewu207/wizard-precoded)
 [![License](https://img.shields.io/badge/license-research%20only-lightgrey.svg)](LICENSE.md)
 
-<img src="assets/teaser.jpg" width="92%">
+<img src="assets/overview.webp" width="100%">
 
 **Change the world as you play.** Wizard keeps the game state explicit and lets a real-time video model paint it.<br>
 Watch the trailer and the interactive demos on the [project page](https://wyzardwu.github.io/wizard/).
@@ -33,8 +33,6 @@ rules for the fight. Agents edit that state from one image, a typed instruction 
 **visual proxy**; a causal video model built on [Wan2.2-TI2V-5B](https://github.com/Wan-Video/Wan2.2) turns the proxy
 into game frames at **20 FPS with two denoising steps**. Every scene and character shown on the project page is new to
 the model.
-
-<div align="center"><img src="assets/overview.webp" width="100%"><br><em>Four ways to play, built on fine-grained control, zero-shot generalization and mechanics-consistent gameplay.</em></div>
 
 ## Highlights
 
