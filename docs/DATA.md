@@ -26,7 +26,7 @@ Each row belongs to a **group**, used for the mixing weights (`--group_rep group
 | `roam` | roaming recordings |
 | `sfly`, `sfly_replay`, `lookback`, `lookback0` | revisits: the camera comes back to a place it has seen |
 | `ww`, `er`, `ue`, `bk` | duels |
-| `wedit` | world edits (stages 1 from 3k, 2 and 3) |
+| `wedit` | world edits (stages 1, 2 and 3) |
 
 The pre-encoded data is released in [`yuzhewu207/wizard-precoded`](https://huggingface.co/datasets/yuzhewu207/wizard-precoded) (the exact files the models were trained on, minus the WildWorld windows; see the WildWorld note in the README): group `ww` has no rows). Restore it with
 
