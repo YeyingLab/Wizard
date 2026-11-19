@@ -1,6 +1,6 @@
 """Sampling from the bidirectional teacher on a prepared case.
 
-A case directory holds cond_v7.mkv (the visual proxy), tier7.npy (token tiers), gbuf.npz / world_px.npz (geometry and
+A case directory holds proxy.mkv (the visual proxy), tier.npy (token tiers), gbuf.npz / world_px.npz (geometry and
 cameras), slots.npz, first_frame.png and prompt.txt. Memory frames are retrieved per chunk from the frames generated so far.
 
     python -m wizard.inference.bidirectional --dit <dit> --case <case dir> --frames 241 --ref1 a.png --ref-slots 2,0 --out out.mp4"""
@@ -17,7 +17,7 @@ from wizard.data.video import W, H, GREY, read
 import wizard.data.gbuffer as G
 
 
-def read7(path, frames):
+def read_proxy(path, frames):
     """the proxy exactly as the data pipeline fed the VAE: AREA to 853x480, centre crop x 10..842"""
     raw = subprocess.run(["ffmpeg", "-v", "error", "-i", path, "-vf", "scale=853:480:flags=area,crop=832:480:10:0", "-frames:v", str(frames), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], capture_output=True).stdout
     v = np.frombuffer(raw, np.uint8).reshape(-1, 480, 832, 3); return v if len(v) >= frames else None
@@ -49,8 +49,8 @@ def main():
     ctx = emb(open(a.prompt_file or f"{C}/prompt.txt").read().strip()); neg = emb(""); del t5; torch.cuda.empty_cache()
     vae = Wan2_2_VAE(vae_pth=f"{CK}/Wan2.2_VAE.pth", device=dev); T = lambda v: torch.from_numpy(np.ascontiguousarray(v)).permute(3, 0, 1, 2).float().div(127.5).sub(1.0).to(dev)
     cond = read(f"{C}/cond.mp4", NF); assert cond is not None                                       # the character masks
-    v7c = read7(f"{C}/cond_v7.mkv", NF); assert v7c is not None, "the case has no proxy video (cond_v7.mkv)"      # the condition the model sees
-    t7 = torch.from_numpy(np.load(f"{C}/tier7.npy")[:NF].astype(np.float32))                          # token tier per cell
+    proxy_v = read_proxy(f"{C}/proxy.mkv", NF); assert proxy_v is not None, "the case has no proxy video (proxy.mkv)"      # the condition the model sees
+    tier_all = torch.from_numpy(np.load(f"{C}/tier.npy")[:NF].astype(np.float32))                          # token tier per cell
     act_v = np.where((cond[..., 1] >= 20)[..., None], cond, 0).astype(np.uint8)                       # the actor layer (encode_actor.py, G_MIN 20)
     fi = Image.open(f"{C}/first_frame.png").convert("RGB"); ff = np.asarray(fi.resize((round(H * 16 / 9), H), Image.LANCZOS)); o = (ff.shape[1] - W) // 2; ff = ff[:, o:o + W]
     img = lambda p: T(np.asarray((Image.open(p) if p else Image.new("RGB", (480, 480), GREY)).convert("RGB").resize((480, 480), Image.LANCZOS))[None])
@@ -63,7 +63,7 @@ def main():
     K = torch.from_numpy(g["K"]); origin = torch.from_numpy(g["origin"]); hp = float(g["hp"])
     actc = torch.from_numpy(cond[..., 1] >= 20).float()[:, None]; actc = F.max_pool2d(actc, 8)[:, 0] > 0                                  # [NF,60,104] character cells
     actc = F.max_pool2d(actc.float()[:, None], 5, 1, 2)[:, 0] > 0                                                                         # grown 2 cells (as training)
-    if not a.nofill:                                    # training's window depth is env-filled + harmonic-smoothed behind every character (gbuf2 + smooth_env):
+    if not a.nofill:                                    # training's window depth is env-filled + harmonic-smoothed behind every character (geometry + smooth_env):
         from wizard.data.env_fill import fill_env, smooth_env      # do the same here, actor cells as gbuf_synth (skeleton cells > 5%, grown 3 cells), else crisp background behind the boss
         import cv2
         a7 = ((cond[..., 1] >= 20).reshape(NF, 60, 8, 104, 8).mean((2, 4)) > 0.05)
@@ -88,19 +88,19 @@ def main():
     attach_cond(mdl); attach_world(mdl); info = mdl.load_state_dict(st.load_file(a.dit), strict=False, assign=True)
     assert not [k for k in info.missing_keys if "rope" not in k], info.missing_keys[:5]
     mdl.rope = type(mdl.rope)(mdl.dim // mdl.num_heads, max_pos=1024); mdl = mdl.to(dev, torch.bfloat16).eval()
-    made = [ff]; MT = None; v7c = np.array(v7c)                                          # (writable: --maintain edits later frames)                                                                                         # pixel frames made so far (frame 0 = the first frame)
+    made = [ff]; MT = None; proxy_v = np.array(proxy_v)                                          # (writable: --maintain edits later frames)                                                                                         # pixel frames made so far (frame 0 = the first frame)
     log = open(a.out[:-4] + ".log", "w")
     WORLD = a.maintain and os.environ.get("MAINT_WORLD") and os.path.exists(f"{C}/world_px.npz")
     if WORLD:                                                                            # the first frame's world is the maintainer's from the start
         from wizard.world.world_maintainer import WorldMaintainer
-        os.environ["ONE_RECON"] = "1"; MT = WorldMaintainer(C, v7c, cond, t7, dep_all, pos_all, R_all, K)
+        os.environ["ONE_RECON"] = "1"; MT = WorldMaintainer(C, proxy_v, cond, tier_all, dep_all, pos_all, R_all, K)
         nch = MT.update_world(made, 0, 0, 0) if (os.environ.get("COARSE_WORLD") != "1" or os.environ.get("SELF_FIRST") == "1") else 0   # coarse world: the case's own first-frame world is kept as it is
         for t_, (cn, cs) in MT.cells.items():
             dep_win[t_][cn] = dep_all[t_][cn]; dep_win[t_][cs] = 0.0; dep_g[t_] = dep_all[t_] * torch.from_numpy(~a7[t_])
         print(f"world from the first frame: {nch} pixels | {MT.log[-1:]}", flush=True)
     for s in range(0, NF - 1, 120):
         sl = slice(s, s + N); first = made[s]
-        with torch.no_grad(): z0 = vae.encode([T(first[None])])[0][None].float(); zc = vae.encode([T(v7c[sl])])[0][None].to(torch.bfloat16)
+        with torch.no_grad(): z0 = vae.encode([T(first[None])])[0][None].float(); zc = vae.encode([T(proxy_v[sl])])[0][None].to(torch.bfloat16)
         cover = np.zeros((L, 15, 26, 3), np.float16); tok = tok_all[sl]; cover[0] = tok[0]
         for j in range(1, L): cover[j] = tok[4 * j - 3: 4 * j + 1].max(0)
         dep = dep_win[sl]; pos = pos_all[sl]; R = R_all[sl]
@@ -131,7 +131,7 @@ def main():
             if a.rest: gm[j] = rest_xyz(gm[j][None], g["rest"][f:f + 1], (dep_all[f] * (~actc[f]))[None].numpy(), origin, hp, dev)[0]
             hm = torch.zeros(15, 26, dtype=torch.bool)
             hm |= torch.from_numpy(tok_all[f].max(-1) > 0.02) | (F.max_pool2d(actc[f].float()[None, None], 4)[0, 0] > 0)   # every character, the player too
-            gm[j, 7] = t7[f].to(dev) / 3.0
+            gm[j, 7] = tier_all[f].to(dev) / 3.0
             if os.environ.get("MEM_TIER_TRAIN", "1") == "1": gm[j, 7] = ((dmem * (~actc[f])) > 0).float().to(dev)   # training's memory frames: tier = 3 wherever they have depth (roam bank), whatever the window's tier
             hide[0, j] = (F.max_pool2d(hm.float()[None, None], 3, 1, 1)[0, 0] > 0).reshape(-1)
         print(f"window {s}: memory pool {pool} | per chunk {per}", flush=True); log.write(f"window {s}: pool {pool} per chunk {per}\n")
@@ -141,9 +141,9 @@ def main():
         if os.environ.get("ATTN_DIAG") and s == 0: import wizard.models.attn_diag as AD; AD.install()
         sched = FlowMatchScheduler(shift=a.shift); tsteps = sched.set_timesteps(a.steps, device=dev)
         gen = torch.Generator(device=dev).manual_seed(a.seed + s); x = torch.randn((1, 48, L, 30, 52), device=dev, generator=gen); x[:, :, 0] = z0[:, :, 0]
-        gc = torch.cat([gc[:3], (gc[3:4] > 0).to(gc.dtype), torch.zeros_like(gc[4:7]), (t7[sl].to(dev) / 3.0)[None].to(gc.dtype)], 0)   # coordinate + has + tier
+        gc = torch.cat([gc[:3], (gc[3:4] > 0).to(gc.dtype), torch.zeros_like(gc[4:7]), (tier_all[sl].to(dev) / 3.0)[None].to(gc.dtype)], 0)   # coordinate + has + tier
         gm = torch.cat([gm[:, :3], (gm[:, 3:4] > 0).to(gm.dtype), torch.zeros_like(gm[:, 4:7]), gm[:, 7:8]], 1)
-        if os.environ.get("INF_UNK_NOCOORD") == "1": gc[:4] = torch.where((t7[sl].to(dev) == 1)[None], torch.zeros_like(gc[:4]), gc[:4])   # as training UNK_NOCOORD=1
+        if os.environ.get("INF_UNK_NOCOORD") == "1": gc[:4] = torch.where((tier_all[sl].to(dev) == 1)[None], torch.zeros_like(gc[:4]), gc[:4])   # as training UNK_NOCOORD=1
         mdl._gb_in = (gc[None], gm[None])
         mdl._mem_warp = None
         mdl._mem_wrope = None
@@ -174,10 +174,10 @@ def main():
             if MT is None:
                 if os.path.exists(f"{C}/world_px.npz"):                                   # one world: case geometry + meshes grown from the generated frames
                     from wizard.world.world_maintainer import WorldMaintainer
-                    MT = WorldMaintainer(C, v7c, cond, t7, dep_all, pos_all, R_all, K)
+                    MT = WorldMaintainer(C, proxy_v, cond, tier_all, dep_all, pos_all, R_all, K)
                 else:
                     from wizard.world.maintainer import Maintainer
-                    MT = Maintainer(v7c, cond, t7, dep_all, pos_all, R_all, K, actc)
+                    MT = Maintainer(proxy_v, cond, tier_all, dep_all, pos_all, R_all, K, actc)
             nch = MT.update_world(made, s, s + 120, s + 121) if WORLD else (MT.update_recon if os.environ.get("MAINT_RECON") and hasattr(MT, "update_recon") else MT.update)(made, s, s + 120, s + 121)
             for t_, (cn, cs) in MT.cells.items():
                 dep_win[t_][cn] = dep_all[t_][cn]; dep_win[t_][cs] = 0.0; dep_g[t_] = dep_all[t_] * torch.from_numpy(~a7[t_])
@@ -188,7 +188,7 @@ def main():
     for p, v in ((a.out, side), (a.out[:-4] + "_gen.mp4", vid)):
         subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{v.shape[2]}x{v.shape[1]}", "-r", "30", "-i", "-", "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", p], input=v.tobytes(), check=True)
     if a.maintain:                                                                       # the condition as maintained (what the later windows saw)
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "1664x480", "-r", "30", "-i", "-", "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", a.out[:-4] + "_cond7.mp4"], input=np.ascontiguousarray(np.concatenate([vid, v7c[:NF]], 2)).tobytes())
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", "1664x480", "-r", "30", "-i", "-", "-c:v", "libx264", "-crf", "16", "-pix_fmt", "yuv420p", a.out[:-4] + "_proxy.mp4"], input=np.ascontiguousarray(np.concatenate([vid, proxy_v[:NF]], 2)).tobytes())
     print("INFER wrote", a.out, side.shape, flush=True)
 
 

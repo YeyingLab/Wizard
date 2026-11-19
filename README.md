@@ -6,6 +6,8 @@
 
 [![arXiv](https://img.shields.io/badge/arXiv-2610.40339-b31b1b.svg)](https://arxiv.org/abs/2610.40339)
 [![Project Page](https://img.shields.io/badge/Project-Page-4b8bbe.svg)](https://wyzardwu.github.io/wizard/)
+[![Weights & Data](https://img.shields.io/badge/%F0%9F%A4%97-Weights%20%26%20Data-ffcc4d.svg)](https://huggingface.co/datasets/yuzhewu207/wizard)
+[![Pre-encoded data](https://img.shields.io/badge/%F0%9F%A4%97-Pre--encoded%20data-ffcc4d.svg)](https://huggingface.co/datasets/yuzhewu207/wizard-precoded)
 ![Python](https://img.shields.io/badge/python-3.12-blue.svg)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.11-ee4c2c.svg)
 
@@ -67,11 +69,17 @@ in its own environment (see [docs/INFERENCE.md](docs/INFERENCE.md)).
 ```bash
 export WAN_CKPT=/path/to/Wan2.2-TI2V-5B
 
-# real-time 2-step student on a prepared case (241 frames)
-bash scripts/infer/run_case.sh causal checkpoints/dmd.safetensors cases/my_case out.mp4 --ref1 boss.png --ref-slots 2,0
+# weights and three ready-made cases (first frame, proxy video, reference images, our outputs)
+huggingface-cli download yuzhewu207/wizard --repo-type dataset \
+    --include "weights/causal_dmd/*" "examples/*" --local-dir hf_wizard
+C=hf_wizard/examples/fight_character_strikes_player
 
-# the same with an online-maintained 3D world; FAST=1 runs the maintenance on the second GPU
-CUDA_VISIBLE_DEVICES=0,1 FAST=1 bash scripts/infer/run_case.sh world checkpoints/dmd.safetensors cases/my_case out.mp4
+# real-time 2-step student
+FRAMES=121 bash scripts/infer/run_case.sh causal hf_wizard/weights/causal_dmd/ema_step480.safetensors $C out.mp4 \
+    --ref1 $C/ref_a.png --ref2 $C/ref_b.png --ref-slots 2,3
+
+# with an online-maintained 3D world (needs world_px.npz in the case); FAST=1 runs the maintenance on the second GPU
+CUDA_VISIBLE_DEVICES=0,1 FAST=1 bash scripts/infer/run_case.sh world <dit> <case> out.mp4
 ```
 
 Each run writes `out.mp4` (generation | proxy) and `out_gen.mp4` (generation only). The case format is described in
@@ -91,7 +99,27 @@ Commands, hyper-parameters and the data layout: [docs/TRAINING.md](docs/TRAINING
 
 ## Checkpoints
 
-The trained weights are not released yet.
+All weights are DiT checkpoints fine-tuned from Wan2.2-TI2V-5B (the VAE and T5 are the official ones), in the `weights/` folder of [`yuzhewu207/wizard`](https://huggingface.co/datasets/yuzhewu207/wizard):
+
+| File | Model | Sampling |
+|---|---|---|
+| `causal_dmd/ema_step480.safetensors` | real-time 2-step student (stage 4, DMD) | `causal` / `world`, 2 steps |
+| `causal_cd/ema_step10000.safetensors` | consistency-distilled student (stage 3), the starting point of DMD | `causal` / `world`, 2 steps |
+| `causal_teacher/dit_step11000.safetensors` | causal teacher (stage 2) | teacher of stage 3 |
+| `bidirectional_main/dit_step35000.safetensors` | bidirectional teacher (stage 1), the model of the paper's main table | `bidirectional`, 30 steps, CFG 3 |
+| `bidirectional/dit_step35000.safetensors` | bidirectional teacher trained with the world-edit clips as well | `bidirectional`, 30 steps, CFG 3 |
+
+```bash
+huggingface-cli download yuzhewu207/wizard --repo-type dataset --include "weights/causal_dmd/*" --local-dir hf_wizard
+```
+
+**Other base models.** The approach is not tied to Wan: the visual proxy, the reference binding and the training recipe carry over to other video backbones. We also trained it on [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) (22B) as a LoRA; the weights are in [`weights/ltx25_lora/`](https://huggingface.co/datasets/yuzhewu207/wizard/tree/main/weights/ltx25_lora) (an earlier proxy format without tiers or memory; its inference code, a modified LTX-2 pipeline with the reference-image conditioning, is not part of this repository).
+
+## Data
+
+- **Pre-encoded training data** (the exact files the models were trained on): [`yuzhewu207/wizard-precoded`](https://huggingface.co/datasets/yuzhewu207/wizard-precoded), restored with `scripts/data/restore_precoded.py`; see [docs/DATA.md](docs/DATA.md).
+- **Raw training data** (videos, proxy videos, geometry, memory banks, reference images): [`yuzhewu207/wizard`](https://huggingface.co/datasets/yuzhewu207/wizard).
+- **WildWorld**: about half of the training windows come from [WildWorld](https://huggingface.co/datasets/AlayaLab/WildWorld), which cannot be redistributed; [`ww_index`](https://huggingface.co/datasets/yuzhewu207/wizard-precoded/tree/main/ww_index) lists the windows and the scripts to rebuild them from the upstream dataset.
 
 ## Repository structure
 
@@ -106,7 +134,7 @@ wizard/
 ├── world/        online world maintenance (point cache, meshes, reconstruction workers)
 └── vendor/wan/   Wan2.2 VAE and T5 encoder
 configs/          accelerate / FSDP configs
-scripts/          training and inference entry points
+scripts/          training, inference and data-restore (scripts/data/restore_precoded.py) entry points
 tools/            case utilities
 docs/             data, training and inference guides
 ```
@@ -135,3 +163,7 @@ from it) and [DiffSynth-Studio](https://github.com/modelscope/DiffSynth-Studio) 
 Causal Forcing++, [CausVid](https://github.com/tianweiy/CausVid), [Self-Forcing](https://github.com/guandeh17/Self-Forcing)
 and [DMD2](https://github.com/tianweiy/DMD2); world maintenance follows [GEN3C](https://github.com/nv-tlabs/GEN3C) and
 uses [MapAnything](https://github.com/facebookresearch/map-anything).
+
+## Licence
+
+Non-commercial research use only; see [LICENSE.md](LICENSE.md).

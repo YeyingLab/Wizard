@@ -5,7 +5,7 @@ attends to the clean frames before it inside a sliding history window plus an at
 to the reference images. `forward_tf` is the forward that inference (`wizard.inference.stream`) reproduces with a KV cache.
 
     accelerate launch --config_file configs/accelerate/fsdp.yaml --num_processes 8 -m wizard.train.causal \
-        --data $WIZARD_DATA/wan_v7 --init <bidirectional dit> --out runs/causal [--grad_accum N]"""
+        --data $WIZARD_DATA/windows --init <bidirectional dit> --out runs/causal [--grad_accum N]"""
 import os, sys, time, json, random, argparse, collections
 import torch
 
@@ -156,7 +156,7 @@ def main():
     info = model.load_state_dict(st.load_file(a.init), strict=False)
     bad = [k for k in info.missing_keys if "rope" not in k]; assert not bad and not info.unexpected_keys, (bad[:5], info.unexpected_keys[:5])
     log(f"AR teacher forcing <- {a.init} (step {a.step0}); history window {a.window} + sink {a.sink}; memory = past only")
-    rows = [json.loads(l) for l in open(os.path.join(a.data, "v7_rows.jsonl"))]
+    rows = [json.loads(l) for l in open(os.path.join(a.data, "rows.jsonl"))]
     for er in [x for x in a.extra_rows.split(",") if x]: rows += [json.loads(l) for l in open(er)]
     if a.limit: rows = rows[:a.limit] + [r for r in rows if r["group"] == "roam"][:a.limit]
     rep = {k: int(v) for k, v in (x.split(":") for x in a.group_rep.split(","))}
@@ -166,7 +166,7 @@ def main():
     c = collections.Counter(r["group"] for r in train); log(f"rows {len(rows)} -> {len(train)}:", {k: f"{v} ({100 * v / len(train):.1f}%)" for k, v in sorted(c.items())})
     ds = ARData(a.data, train, a); log(f"SceneFly memory picks kept past-only: {ds.past_info[1]} of {ds.past_info[0]}")
     if main_: json.dump({"args": vars(a), "rows": len(rows)}, open(os.path.join(a.out, f"args_{a.step0}.json"), "w"), indent=1)
-    neg = lt(f"{DS}/wan_mix5/neg_emb.pt")["neg_emb"]; neg = torch.cat([neg, neg.new_zeros(512 - neg.shape[0], neg.shape[1])])[None]
+    neg = lt(f"{DS}/samples/neg_emb.pt")["neg_emb"]; neg = torch.cat([neg, neg.new_zeros(512 - neg.shape[0], neg.shape[1])])[None]
     dl = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=True, num_workers=a.num_workers, collate_fn=collate, drop_last=True, pin_memory=True, persistent_workers=True)
     hi = ("cond_embedding", "gbuf_embedding")
     opt = torch.optim.AdamW([dict(params=[p for n_, p in model.named_parameters() if not n_.startswith(hi)], lr=a.lr),

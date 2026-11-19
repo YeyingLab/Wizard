@@ -5,7 +5,7 @@ G-buffer, gated references); the real score and the fake score (critic) are the 
 memory, real score with CFG. Critic : student updates = 5 : 1, gradient accumulation, gradient only on a random window of latent frames.
 
     accelerate launch --config_file configs/accelerate/fsdp_dmd.yaml --num_processes 8 -m wizard.distill.dmd \
-        --data $WIZARD_DATA/wan_v7 --student <cd ema> --real <bidirectional dit> --out runs/dmd --accum 4 --cfg 3
+        --data $WIZARD_DATA/windows --student <cd ema> --real <bidirectional dit> --out runs/dmd --accum 4 --cfg 3
     resume: --student <dmd ema> --fake <runs/dmd/fake_last.safetensors> --step0 <step>"""
 import os, sys, glob, json, time, argparse, random, collections
 import torch
@@ -150,7 +150,7 @@ def main():
     fake = WizardDiT(**ti2v_5b_config(), causal=False, zero_init_head=False); attach_cond(fake); attach_world(fake); load(fake, a.fake or a.real)
     real_core, fake_core = real, fake                                                    # _gb_in lives on the bare modules
     student.use_gradient_checkpointing = True; fake.use_gradient_checkpointing = True
-    rows = [json.loads(l) for l in open(os.path.join(a.data, "v7_rows.jsonl"))]            # data = wizard.distill.consistency's
+    rows = [json.loads(l) for l in open(os.path.join(a.data, "rows.jsonl"))]            # data = wizard.distill.consistency's
     for er in [x for x in a.extra_rows.split(",") if x]: rows += [json.loads(l) for l in open(er)]
     if a.limit: rows = rows[:a.limit] + [r for r in rows if r["group"] == "roam"][:a.limit]
     rep = {k: int(v) for k, v in (x.split(":") for x in a.group_rep.split(","))}
@@ -158,10 +158,10 @@ def main():
     nrep = lambda r: a.rep_mem if (a.rep_mem and r["group"] == "roam" and rk is not None and r["key"] in rk) else rep.get(r["group"], 1)
     files = [r for r in rows for _ in range(nrep(r))]
     c = collections.Counter(r["group"] for r in files); log("group_rep", rep, "->", {k: f"{v} ({100 * v / len(files):.1f}%)" for k, v in sorted(c.items())})
-    log(f"DMD v7 student <- {a.student} | real / fake score <- {a.real} (bidirectional, cfg {a.cfg}) | levels {levels} | autoregressive rollout, window {a.windowed_train} + sink {a.windowed_sink} | world {accel.num_processes} x accum {a.accum} = batch {accel.num_processes * a.accum} | rows {len(files)} | lr {a.lr} / critic {a.lr_critic} x{a.critic_steps}")
+    log(f"DMD student <- {a.student} | real / fake score <- {a.real} (bidirectional, cfg {a.cfg}) | levels {levels} | autoregressive rollout, window {a.windowed_train} + sink {a.windowed_sink} | world {accel.num_processes} x accum {a.accum} = batch {accel.num_processes * a.accum} | rows {len(files)} | lr {a.lr} / critic {a.lr_critic} x{a.critic_steps}")
     if main_: json.dump(vars(a), open(os.path.join(a.out, "args.json"), "w"), indent=1)
     ds = A.ARData(a.data, files, a)
-    neg = lt(f"{DS}/wan_mix5/neg_emb.pt")["neg_emb"]; neg = torch.cat([neg, neg.new_zeros(512 - neg.shape[0], neg.shape[1])])     # empty prompt zero-padded to 512 tokens
+    neg = lt(f"{DS}/samples/neg_emb.pt")["neg_emb"]; neg = torch.cat([neg, neg.new_zeros(512 - neg.shape[0], neg.shape[1])])     # empty prompt zero-padded to 512 tokens
     assert neg.shape[0] == 512, neg.shape
     dl = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=True, num_workers=a.num_workers, collate_fn=collate, drop_last=True, pin_memory=True, persistent_workers=True)
     def adam(p, lr):

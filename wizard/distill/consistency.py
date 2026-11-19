@@ -4,7 +4,7 @@ Discrete consistency axis (N levels); the teacher takes one Euler step t -> t_ne
 the EMA's x0(x_t_next). Inputs (memory, G-buffer, references, history) are the teacher's.
 
     accelerate launch --config_file configs/accelerate/fsdp_dmd.yaml --num_processes 8 -m wizard.distill.consistency \
-        --data $WIZARD_DATA/wan_v7 --ckpt <causal teacher dit> --out runs/cd [data arguments]"""
+        --data $WIZARD_DATA/windows --ckpt <causal teacher dit> --out runs/cd [data arguments]"""
 import os, sys, time, json, random, argparse, collections
 import torch, torch.nn.functional as F
 
@@ -77,7 +77,7 @@ def main():
         m = A.build_model(a); info = m.load_state_dict(st.load_file(a.ckpt), strict=False)
         bad = [k for k in info.missing_keys if "rope" not in k]; assert not bad and not info.unexpected_keys, (bad[:5], info.unexpected_keys[:5]); models.append(m)
     cores = list(models); student, ema, teacher = models; student.use_gradient_checkpointing = True; ema.use_gradient_checkpointing = False; teacher.use_gradient_checkpointing = False
-    rows = [json.loads(l) for l in open(os.path.join(a.data, "v7_rows.jsonl"))]
+    rows = [json.loads(l) for l in open(os.path.join(a.data, "rows.jsonl"))]
     for er in [x for x in a.extra_rows.split(",") if x]: rows += [json.loads(l) for l in open(er)]
     if a.limit: rows = rows[:a.limit] + [r for r in rows if r["group"] == "roam"][:a.limit]
     rep = {k: int(v) for k, v in (x.split(":") for x in a.group_rep.split(","))}
@@ -85,11 +85,11 @@ def main():
     nrep = lambda r: a.rep_mem if (a.rep_mem and r["group"] == "roam" and rk is not None and r["key"] in rk) else rep.get(r["group"], 1)
     train = [r for r in rows for _ in range(nrep(r))]
     c = collections.Counter(r["group"] for r in train)
-    log(f"CD v7 (teacher cfg {a.cfg}, all window {a.window}+{a.sink}) <- {a.ckpt}; world {accel.num_processes}; N {a.N} lr {a.lr}")
+    log(f"CD (teacher cfg {a.cfg}, all window {a.window}+{a.sink}) <- {a.ckpt}; world {accel.num_processes}; N {a.N} lr {a.lr}")
     log(f"rows {len(rows)} -> {len(train)}:", {k: f"{v} ({100 * v / len(train):.1f}%)" for k, v in sorted(c.items())})
     ds = A.ARData(a.data, train, a); log(f"SceneFly memory picks kept past-only: {ds.past_info[1]} of {ds.past_info[0]}")
     if main_: json.dump(vars(a), open(os.path.join(a.out, "args.json"), "w"), indent=1)
-    neg = lt(f"{DS}/wan_mix5/neg_emb.pt")["neg_emb"]; neg = torch.cat([neg, neg.new_zeros(512 - neg.shape[0], neg.shape[1])])[None].to(accel.device, torch.bfloat16)
+    neg = lt(f"{DS}/samples/neg_emb.pt")["neg_emb"]; neg = torch.cat([neg, neg.new_zeros(512 - neg.shape[0], neg.shape[1])])[None].to(accel.device, torch.bfloat16)
     dl = torch.utils.data.DataLoader(ds, batch_size=1, shuffle=True, num_workers=a.num_workers, collate_fn=collate, drop_last=True, pin_memory=True, persistent_workers=True)
     import bitsandbytes as bnb
     opt = bnb.optim.AdamW8bit(student.parameters(), lr=a.lr, weight_decay=0.0, betas=(0.0, 0.999))

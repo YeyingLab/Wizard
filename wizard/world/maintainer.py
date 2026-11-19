@@ -1,6 +1,6 @@
 """inference-time world maintenance: after a window is generated, MoGe-2 on its frames -> scale-aligned to the known world ->
 characters removed -> the same surface splat as training's MoGe world (wizard.data.cond_encode_gpu.splat_grid) rendered along the later frames' cameras.
-Only cells that are still UNKNOWN (dark green) change: to coarse (G 77, R = height, B = depth, as build_v7) where the new surface lands,
+Only cells that are still UNKNOWN (dark green) change: to coarse (G 77, R = height, B = depth, as the engine's proxy builder) where the new surface lands,
 to sky where the generated frames' MoGe saw sky in that direction (above the horizon). Tokens (tier, depth) follow."""
 import os, sys, subprocess, tempfile
 import numpy as np, torch, torch.nn.functional as F, cv2
@@ -20,7 +20,7 @@ def moge_depth(frames):
 
 
 def dir_grid(R, H, W, f, cx, cy):
-    """per pixel (pitch, yaw) bins of 0.5 deg (as build_v7.sky_dirs): pitch index 180 = horizon, larger = up"""
+    """per pixel (pitch, yaw) bins of 0.5 deg (as the engine's proxy builder): pitch index 180 = horizon, larger = up"""
     v, u = np.mgrid[0:H, 0:W] + 0.5; x = (u - cx) / f; y = -(v - cy) / f
     d = x[..., None] * R[0] - y[..., None] * (-R[1]) + R[2]                                # world direction (rows right, up, forward)
     d = d / np.linalg.norm(d, axis=-1, keepdims=True)
@@ -30,14 +30,14 @@ def dir_grid(R, H, W, f, cx, cy):
 
 
 class Maintainer:
-    def __init__(self, v7c, cond, t7, dep_all, pos_all, R_all, K, actc, dev="cuda", every=10):
-        self.v7c, self.cond, self.t7, self.dep, self.pos, self.R = v7c, cond, t7, dep_all, pos_all, R_all
-        self.actc = actc; self.dev = dev; self.every = every; self.H, self.W = v7c.shape[1:3]
+    def __init__(self, proxy_v, cond, tier_all, dep_all, pos_all, R_all, K, actc, dev="cuda", every=10):
+        self.proxy_v, self.cond, self.tier_all, self.dep, self.pos, self.R = proxy_v, cond, tier_all, dep_all, pos_all, R_all
+        self.actc = actc; self.dev = dev; self.every = every; self.H, self.W = proxy_v.shape[1:3]
         k = [float(x) for x in K]; self.f, self.cx, self.cy = k[0] * 8, k[2] * 8, k[3] * 8          # the token grid is the 832x480 crop / 8
         self.src = []; self.msrc = []; self.sky = np.zeros((360, 720), bool)
-        # the case's height code R = a * world height + b, fitted on frame 0's known cells (as build_v7.height_fit)
+        # the case's height code R = a * world height + b, fitted on frame 0's known cells (as the engine's proxy builder)
         P = self._world(0, np.kron(self.dep[0].numpy(), np.ones((8, 8))))
-        Rr = v7c[0][..., 0].astype(float) / 255; tier_px = np.kron(self.t7[0].numpy(), np.ones((8, 8)))
+        Rr = proxy_v[0][..., 0].astype(float) / 255; tier_px = np.kron(self.tier_all[0].numpy(), np.ones((8, 8)))
         ok = (tier_px >= 2) & (Rr > 0.52) & (Rr < 0.98) & (cond[0][..., 1] < 20) & (np.kron(self.dep[0].numpy(), np.ones((8, 8))) > 0)
         A = np.stack([P[..., 1][ok], np.ones(ok.sum())], 1); self.ab = np.linalg.lstsq(A, Rr[ok], rcond=None)[0] if ok.sum() > 500 else (0.5 / 56, 0.5)
         self.log = []
@@ -52,7 +52,7 @@ class Maintainer:
         Z, OK = moge_depth(np.stack([made[f] for f in fs]))
         for i, f in enumerate(fs):
             z = Z[i].astype(np.float64); ok = OK[i] & np.isfinite(z) & (z > 0)
-            known = np.kron(self.dep[f].numpy(), np.ones((8, 8))); tier_px = np.kron(self.t7[f].numpy(), np.ones((8, 8)))
+            known = np.kron(self.dep[f].numpy(), np.ones((8, 8))); tier_px = np.kron(self.tier_all[f].numpy(), np.ones((8, 8)))
             act = cv2.dilate((self.cond[f][..., 1] >= 20).astype(np.uint8), np.ones((41, 41), np.uint8)).astype(bool)
             sel = ok & ~act & (known > 0) & (tier_px >= 2)
             if sel.sum() < 300: self.log.append((f, "no overlap")); continue
@@ -69,7 +69,7 @@ class Maintainer:
             g = np.zeros((360, 720), np.uint8); g[p[sk], yw[sk]] = 1; self.sky |= cv2.dilate(g, np.ones((3, 3), np.uint8)).astype(bool)
             self.log.append((f, f"scale {s:.3f} pts {int(okm.sum())} sky {int(sk.sum())}"))
         if not self.src: return 0
-        T = list(range(t_from, len(self.v7c))); pos = self.pos[T].to(self.dev).float(); R = self.R[T].to(self.dev).float()
+        T = list(range(t_from, len(self.proxy_v))); pos = self.pos[T].to(self.dev).float(); R = self.R[T].to(self.dev).float()
         if os.environ.get("MAINT_SPLAT"):
             zc = None
             for Pg, okg in self.src:
@@ -81,7 +81,7 @@ class Maintainer:
             zc = MD.render([MD.grid_mesh(P_, o_, z_) for P_, o_, z_ in self.msrc], self.pos[T].numpy(), self.R[T].numpy(), self.f, self.cx, self.cy, self.H, self.W)
         changed = 0; self.cells = {}
         for i, t in enumerate(T):
-            px = self.v7c[t]; unk = (px[..., 1] >= 30) & (px[..., 1] <= 46) & (px[..., 0] <= 4) & (px[..., 2] <= 4)
+            px = self.proxy_v[t]; unk = (px[..., 1] >= 30) & (px[..., 1] <= 46) & (px[..., 0] <= 4) & (px[..., 2] <= 4)
             new = unk & (zc[i] > 0)
             if new.any():
                 P = self._world(t, zc[i]); Rr = np.clip(self.ab[0] * P[..., 1] + self.ab[1], 0.5, 1.0); Bb = 1 - np.clip((zc[i] - 0.1) / 79.9, 0, 1)
@@ -94,8 +94,8 @@ class Maintainer:
             fn = new.reshape(60, 8, 104, 8).mean((1, 3)); fs_ = skn.reshape(60, 8, 104, 8).mean((1, 3))
             zt = np.where(new, zc[i], np.nan).reshape(60, 8, 104, 8).transpose(0, 2, 1, 3).reshape(60, 104, 64)
             with np.errstate(all="ignore"): zmed = np.nanmedian(zt, -1)
-            cn = torch.from_numpy((fn > 0.5) & (self.t7[t].numpy() == 1)); cs = torch.from_numpy((fs_ > 0.5) & (self.t7[t].numpy() == 1))
-            self.t7[t][cn] = 3.0 if EXACT else 2.0; self.dep[t][cn] = torch.from_numpy(np.nan_to_num(zmed)).float()[cn]
-            self.t7[t][cs] = 0.0; self.dep[t][cs] = 0.0; self.cells[t] = (cn, cs)
+            cn = torch.from_numpy((fn > 0.5) & (self.tier_all[t].numpy() == 1)); cs = torch.from_numpy((fs_ > 0.5) & (self.tier_all[t].numpy() == 1))
+            self.tier_all[t][cn] = 3.0 if EXACT else 2.0; self.dep[t][cn] = torch.from_numpy(np.nan_to_num(zmed)).float()[cn]
+            self.tier_all[t][cs] = 0.0; self.dep[t][cs] = 0.0; self.cells[t] = (cn, cs)
             changed += int(new.sum() + skn.sum())
         return changed

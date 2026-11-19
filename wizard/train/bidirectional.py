@@ -5,7 +5,7 @@ channels, world-coordinate tokens on background cells, retrieved memory frames a
 dataset (`ClipDataset`), `collate` and the data-root constants used by the later stages.
 
     accelerate launch --config_file configs/accelerate/fsdp.yaml --num_processes 8 -m wizard.train.bidirectional \
-        --data $WIZARD_DATA/wan_v7 --out runs/bidir [data / mixing arguments]"""
+        --data $WIZARD_DATA/windows --out runs/bidir [data / mixing arguments]"""
 import os, sys, time, argparse, json, random, collections, math
 import numpy as np
 import torch, torch.nn.functional as F
@@ -19,7 +19,7 @@ import wizard.data.gbuffer as G
 from wizard.data.env_fill import fill_env, smooth_env
 from wizard.data.roam_actor import roam_actor
 from wizard.paths import WAN_CKPT, DATA_ROOT
-CK = WAN_CKPT; DS = DATA_ROOT; MEMROAM = f"{DS}/wan_memroam"; SFLY = f"{DS}/wan_sfly"; V7 = f"{DS}/wan_v7/cond7"
+CK = WAN_CKPT; DS = DATA_ROOT; MEMROAM = f"{DS}/roam_memory"; SFLY = f"{DS}/scenefly"; PROXY = f"{DS}/windows/proxy"
 
 
 def roam_depth(d):
@@ -74,10 +74,10 @@ def cover_dtest(P, pos, R, K, Dt, H, W, tol=0.15):
 class ClipDataset(torch.utils.data.Dataset):
     def __init__(self, root, rows, a):
         self.O, self.rows, self.a = root, rows, a
-        T = lt(f"{DS}/wan_mix5/text_table.pt"); self.emb, self.L = T["emb"], T["text_len"]
+        T = lt(f"{DS}/samples/text_table.pt"); self.emb, self.L = T["emb"], T["text_len"]
         self.roam_text = lt(f"{MEMROAM}/text.pt")["emb"]; self.mem_index = lt(f"{MEMROAM}/{a.mem_index}"); self.meta = collections.OrderedDict()
         self.mroot = {}                                                                   # SceneFly in the memroam layout under its own root
-        for root in (SFLY, SFLY + "_replay", SFLY + "_replay_test"):                                             # replay windows read the same videos' banks (in wan_sfly)
+        for root in (SFLY, SFLY + "_replay", SFLY + "_replay_test"):                                             # replay windows read the same videos' banks (in scenefly)
             if os.path.exists(f"{root}/mem_index.pt"):
                 si = lt(f"{root}/mem_index.pt"); self.mem_index.update(si); self.mroot.update({v["seg"]: SFLY for v in si.values()})
         self.with_prev = [i for i, r in enumerate(rows) if r["prev"]]
@@ -94,8 +94,8 @@ class ClipDataset(torch.utils.data.Dataset):
 
     def first_frame(self, key):
         """a window's first frame as a memory candidate: latent [48,1,30,52], depth/pos/R/K of its frame 0, its character cover [15,26,3]"""
-        c = lt(f"{DS}/wan_mix5/clips/clip_{key}.pt"); g = lt(f"{self.O}/gbuf2/clip_{key}.pt"); p7 = f"{V7}/clip_{key}.pt"
-        if os.path.exists(p7): v = lt(p7); dep, tier = torch.nan_to_num(v["dep"][0].float(), posinf=0.0).clamp(0, 1000), v["tier"][0].float()
+        c = lt(f"{DS}/samples/clips/clip_{key}.pt"); g = lt(f"{self.O}/geometry/clip_{key}.pt"); pp = f"{PROXY}/clip_{key}.pt"
+        if os.path.exists(pp): v = lt(pp); dep, tier = torch.nan_to_num(v["dep"][0].float(), posinf=0.0).clamp(0, 1000), v["tier"][0].float()
         else: dep = g["depth"][0].float() * (~g["actor"][0]); tier = (dep > 0).float() * 3
         return dict(lat=c["latent"][:, :1], depth=dep, tier=tier, pos=g["pos"][0], R=g["R"][0], K=g["K"], cover=c["cover"][0].float(), slots=c["ref_slots"], hideall=True)
 
@@ -120,10 +120,10 @@ class ClipDataset(torch.utils.data.Dataset):
     def __getitem__(self, i):
         r = self.rows[i]; a = self.a
         if r["group"] in ("roam", "sfly", "sfly_replay"): return self.roam(r)                             # SceneFly = roam layout, no characters
-        c = lt(f"{DS}/wan_mix5/clips/clip_{r['key']}.pt"); g = lt(f"{self.O}/gbuf2/clip_{r['key']}.pt"); v7 = lt(f"{V7}/clip_{r['key']}.pt"); act = v7["cond"] if not os.environ.get("SKELETON_DEPTH_COND") else c["cond"]
-        u2 = f"{V7}_unk2/clip_{r['key']}.pt"
-        if getattr(a, "p_unk2", 0.0) > 0 and os.path.exists(u2) and random.random() < a.p_unk2: v7 = lt(u2); act = v7["cond"]   # unk2_build.py
-        dep = v7["dep"].float(); dep = torch.where(torch.isfinite(dep) & (dep < 1000), dep, torch.zeros_like(dep)); unk = v7["tier"].float() / 3.0                         # characters' cells 0; tier rides in the "unknown" slot
+        c = lt(f"{DS}/samples/clips/clip_{r['key']}.pt"); g = lt(f"{self.O}/geometry/clip_{r['key']}.pt"); pv = lt(f"{PROXY}/clip_{r['key']}.pt"); act = pv["cond"] if not os.environ.get("SKELETON_DEPTH_COND") else c["cond"]
+        u2 = f"{PROXY}_unk2/clip_{r['key']}.pt"
+        if getattr(a, "p_unk2", 0.0) > 0 and os.path.exists(u2) and random.random() < a.p_unk2: pv = lt(u2); act = pv["cond"]   # unk2_build.py
+        dep = pv["dep"].float(); dep = torch.where(torch.isfinite(dep) & (dep < 1000), dep, torch.zeros_like(dep)); unk = pv["tier"].float() / 3.0                         # characters' cells 0; tier rides in the "unknown" slot
         cands = {k: self.first_frame(k) for k in r["prev"]}; per = [[] for _ in CH]
         if cands:
             P = G.world_points(dep, g["pos"], g["R"], g["K"]); ok = dep > 0; pts, tcs = [], []
@@ -155,15 +155,15 @@ class ClipDataset(torch.utils.data.Dataset):
             j = int((m["f"] == f).nonzero()[0]); x = lt(f"{self.mroot.get(s, MEMROAM)}/bank/{s}/{f}.pt")
             dj = m["depth"][j].float(); fr.append(dict(lat=x["lat"], depth=dj, tier=(dj > 0).float() * 3, pos=m["pos"][j], R=m["R"][j], K=m["K"][j], cover=torch.zeros(15, 26, 3), slots=torch.zeros(2, dtype=torch.long), hidedep=True))
         g = dict(pos=d["pos"], R=d["R"], K=d["K"], origin=d["origin"], hp=d["hp"])
-        v7 = lt(f"{V7}/clip_{name[5:-3]}.pt")
-        mu = f"{V7}_memunk/clip_{name[5:-3]}.pt"                                          # the environment unknown in the video, coordinates kept
-        if a.p_memunk > 0 and pool and os.path.exists(mu) and random.random() < a.p_memunk: v7 = lt(mu)
-        tu = f"{V7}_{os.environ.get('TU_SUB', 'trueunk')}/clip_{name[5:-3]}.pt"   # TU_SUB=unkcoord: the eval variant with coordinates kept
-        dep_w = torch.nan_to_num(v7["dep"].float(), posinf=0.0).clamp(0, 1000)               # the memory-only loss weight needs the true geometry: trueunk zeroes it
-        if getattr(a, "p_trueunk", 0.0) > 0 and pool and os.path.exists(tu) and random.random() < a.p_trueunk: v7 = lt(tu)
-        elif getattr(a, "p_unk2", 0.0) > 0 and os.path.exists(f"{V7}_unk2/clip_{name[5:-3]}.pt") and random.random() < a.p_unk2: v7 = lt(f"{V7}_unk2/clip_{name[5:-3]}.pt")
-        return self.pack(d["latent"], v7["cond"], self.pad(self.roam_text), torch.zeros(2, 48, 1, 30, 30, dtype=torch.bfloat16), torch.zeros(2, dtype=torch.long),
-                         torch.zeros(31, 15, 26, 3, dtype=torch.float16), g, torch.nan_to_num(v7["dep"].float(), posinf=0.0).clamp(0, 1000), v7["tier"].float() / 3.0, fr, use, torch.zeros(2, dtype=torch.long), dep_w=dep_w)
+        pv = lt(f"{PROXY}/clip_{name[5:-3]}.pt")
+        mu = f"{PROXY}_memunk/clip_{name[5:-3]}.pt"                                          # the environment unknown in the video, coordinates kept
+        if a.p_memunk > 0 and pool and os.path.exists(mu) and random.random() < a.p_memunk: pv = lt(mu)
+        tu = f"{PROXY}_{os.environ.get('TU_SUB', 'trueunk')}/clip_{name[5:-3]}.pt"   # TU_SUB=unkcoord: the eval variant with coordinates kept
+        dep_w = torch.nan_to_num(pv["dep"].float(), posinf=0.0).clamp(0, 1000)               # the memory-only loss weight needs the true geometry: trueunk zeroes it
+        if getattr(a, "p_trueunk", 0.0) > 0 and pool and os.path.exists(tu) and random.random() < a.p_trueunk: pv = lt(tu)
+        elif getattr(a, "p_unk2", 0.0) > 0 and os.path.exists(f"{PROXY}_unk2/clip_{name[5:-3]}.pt") and random.random() < a.p_unk2: pv = lt(f"{PROXY}_unk2/clip_{name[5:-3]}.pt")
+        return self.pack(d["latent"], pv["cond"], self.pad(self.roam_text), torch.zeros(2, 48, 1, 30, 30, dtype=torch.bfloat16), torch.zeros(2, dtype=torch.long),
+                         torch.zeros(31, 15, 26, 3, dtype=torch.float16), g, torch.nan_to_num(pv["dep"].float(), posinf=0.0).clamp(0, 1000), pv["tier"].float() / 3.0, fr, use, torch.zeros(2, dtype=torch.long), dep_w=dep_w)
 
     def pack(self, latent, actor, ctx, ref_lat, ref_slots, cover, g, dep, unk, fr, use, slots_now, dep_w=None):
         n = len(fr); z = lambda shape, dt: torch.zeros((M_MAX,) + shape, dtype=dt)
@@ -283,7 +283,7 @@ def main():
     attach_cond(model); attach_world(model); model.use_gradient_checkpointing = True; core = model
     if a.init:
         import safetensors.torch as st; log(f"init from {a.init}: {model.load_state_dict(st.load_file(a.init), strict=False)}")
-    rows = [json.loads(l) for l in open(os.path.join(a.data, "v7_rows.jsonl"))]
+    rows = [json.loads(l) for l in open(os.path.join(a.data, "rows.jsonl"))]
     for er in [x for x in a.extra_rows.split(",") if x]: rows += [json.loads(l) for l in open(er)]   # e.g. SceneFly rows (group sfly)
     if a.limit: rows = rows[:a.limit] + [r for r in rows if r["group"] == "roam"][:a.limit]
     rep = {k: int(v) for k, v in (x.split(":") for x in a.group_rep.split(","))}
@@ -293,7 +293,7 @@ def main():
     train = [r for r in rows for _ in range(nrep(r))]
     c = collections.Counter(r["group"] for r in train); log(f"rows {len(rows)} -> {len(train)} with group_rep {rep}:", {k: f"{v} ({100 * v / len(train):.1f}%)" for k, v in sorted(c.items())})
     if main_: json.dump({"args": vars(a), "rows": len(rows)}, open(os.path.join(a.out, "args.json"), "w"), indent=1)
-    neg = lt(f"{DS}/wan_mix5/neg_emb.pt")["neg_emb"]; neg = torch.cat([neg, neg.new_zeros(512 - neg.shape[0], neg.shape[1])])[None]   # the empty prompt, zero-padded to 512
+    neg = lt(f"{DS}/samples/neg_emb.pt")["neg_emb"]; neg = torch.cat([neg, neg.new_zeros(512 - neg.shape[0], neg.shape[1])])[None]   # the empty prompt, zero-padded to 512
     dl = torch.utils.data.DataLoader(ClipDataset(a.data, train, a), batch_size=1, shuffle=True, num_workers=a.num_workers, collate_fn=collate, drop_last=True, pin_memory=True, persistent_workers=True)
     hi = ("cond_embedding", "gbuf_embedding")
     opt = torch.optim.AdamW([dict(params=[p for n_, p in model.named_parameters() if not n_.startswith(hi)], lr=a.lr),

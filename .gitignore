@@ -3,7 +3,7 @@ __pycache__/
 *.egg-info/
 runs/
 checkpoints/
-data/
+/data/
 *.safetensors
 *.pt
 *.mp4

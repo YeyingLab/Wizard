@@ -1,5 +1,5 @@
 """inference world maintenance, ONE world:
-  world = the case's known geometry (per pixel, <case>/world_px.npz from depth_edit_v7 DUMP_Z=1; the first frame's world as EXACT, V7_SEEN_EXACT=1)
+  world = the case's known geometry (per pixel, <case>/world_px.npz written by the engine; the first frame's world as EXACT)
           + meshes grown from the generated frames.
   After a window: its keyframes in order; each one's MoGe-2 depth is scale-aligned to the CURRENT world rendered at that camera, and only the part the
   world does not have yet is added (still-unknown pixels, not sky, not characters), stitched to the surfaces it touches (a ring with the world's own
@@ -72,17 +72,17 @@ def seg_labels(img):
     _SEG[key] = lab; return lab
 
 class WorldMaintainer:
-    def __init__(self, case, v7c, cond, t7, dep_all, pos_all, R_all, K, every=10, min_frag=600):
+    def __init__(self, case, proxy_v, cond, tier_all, dep_all, pos_all, R_all, K, every=10, min_frag=600):
         w = np.load(f"{case}/world_px.npz"); self.Zc = w["z"].astype(np.float32); self.Tc = w["tier"]
-        self.v7c, self.cond, self.t7, self.dep, self.pos, self.R = v7c, cond, t7, dep_all, pos_all, R_all
-        k = [float(x) for x in K]; self.f, self.cx, self.cy = k[0] * 8, k[2] * 8, k[3] * 8; self.H, self.W = v7c.shape[1:3]
+        self.proxy_v, self.cond, self.tier_all, self.dep, self.pos, self.R = proxy_v, cond, tier_all, dep_all, pos_all, R_all
+        k = [float(x) for x in K]; self.f, self.cx, self.cy = k[0] * 8, k[2] * 8, k[3] * 8; self.H, self.W = proxy_v.shape[1:3]
         self.every, self.min_frag = every, min_frag; self.cells = {}; self.meshes = []; self.fmeshes = []; self.hpts = []; self.coarse = os.environ.get("COARSE_WORLD") == "1"; self.case_seen = self.coarse and os.environ.get("SELF_FIRST", "0") != "1"; self.scales = []; self.one = bool(os.environ.get("ONE_RECON")); self.sky = np.zeros((360, 720), bool); self.log = []
         pb = np.load(f"{case}/slots.npz")["pixel_bits"][:len(cond)].repeat(4, 1).repeat(4, 2)      # the TRUE character pixels (the lossy cond.mp4 lifts G >= 20 along terrain edges)
         ys = (np.arange(self.H) * 576 / self.H).astype(int); xs = ((np.arange(self.W) + (853 - self.W) / 2) * 1024 / 853).astype(int)
         self.chr = [(b[ys][:, xs] > 0) for b in pb]
         self.ch = [cv2.dilate(m.astype(np.uint8), np.ones((5, 5), np.uint8)).astype(bool) for m in self.chr]   # characters + their outline
         # height code R = a * world height + b, fitted on the case's exact environment pixels of frame 0
-        Pw = self._world(0, self.Zc[0]); ok = (self.Tc[0] >= 2) & ~self.ch[0] & (self.Zc[0] > 0); Rr = v7c[0][..., 0].astype(float) / 255
+        Pw = self._world(0, self.Zc[0]); ok = (self.Tc[0] >= 2) & ~self.ch[0] & (self.Zc[0] > 0); Rr = proxy_v[0][..., 0].astype(float) / 255
         ok &= (Rr > 0.51) & (Rr < 0.99)
         A = np.stack([Pw[..., 1][ok], np.ones(ok.sum())], 1); self.ab = np.linalg.lstsq(A, Rr[ok], rcond=None)[0] if ok.sum() > 500 else np.array([0.5 / 56, 0.5])
 
@@ -434,7 +434,7 @@ class WorldMaintainer:
     def _paint_world(self, t_from):
         """every environment pixel of the later frames from the frozen world (one encoding); sky directions black; the rest unknown"""
         self.sky = cv2.morphologyEx(self.sky.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((7, 7), np.uint8)).astype(bool)
-        T = list(range(t_from, len(self.v7c)))
+        T = list(range(t_from, len(self.proxy_v)))
         if os.environ.get("PAINT_AHEAD"): T = T[:int(os.environ["PAINT_AHEAD"])]            # only the frames about to be made (the rest is painted by later updates)
         import time as _t; _a = _t.time(); GZ = self._frozen(T); changed = 0; self.cells = {}; _tm = dict(frozen=_t.time() - _a, crack=0.0, shade=0.0, med=0.0, rest=0.0)
         _a = _t.time()
@@ -443,7 +443,7 @@ class WorldMaintainer:
             if cl.any(): GZ[i] = np.where(cl, cv2.dilate(GZ[i], np.ones((9, 1), np.uint8)), GZ[i])
         _tm["crack"] = _t.time() - _a
         def _one(i, t):                                                                       # one frame; frames are independent (PAINT_THREADS > 1 paints them in parallel)
-            px = self.v7c[t]; env = ~self.ch[t] & ((self.Tc[t] == 1) if self.case_seen else True); new = env & (GZ[i] > 0)
+            px = self.proxy_v[t]; env = ~self.ch[t] & ((self.Tc[t] == 1) if self.case_seen else True); new = env & (GZ[i] > 0)
             p, yw = MV.dir_grid(self.R[t].numpy().astype(float), self.H, self.W, self.f, self.cx, self.cy)
             skn = env & ~new & self.sky[p, yw] & (p >= 180); unk = env & ~new & ~skn
             zf = GZ[i]; Pw = self._world(t, zf); Rr = np.clip(self.ab[0] * Pw[..., 1] + self.ab[1], 0.5, 1.0); Bb = 1 - np.clip((zf - 0.1) / 79.9, 0, 1)
@@ -456,8 +456,8 @@ class WorldMaintainer:
             zt = np.where(new, zf, np.nan).reshape(60, 8, 104, 8).transpose(0, 2, 1, 3).reshape(60, 104, 64)
             with np.errstate(all="ignore"): zmed = np.nanmedian(zt, -1)
             cn = torch.from_numpy(fn > 0.5); cs = torch.from_numpy(fs_ > 0.5); cu = torch.from_numpy((fu > 0.5) & ~(fn > 0.5) & ~(fs_ > 0.5))
-            if self.case_seen: k1 = torch.from_numpy(self.t7[t].numpy() == 1); cn = cn & k1; cs = cs & k1; cu = cu & k1
-            self.t7[t][cn] = 2.0 if self.coarse else 3.0; self.dep[t][cn] = torch.from_numpy(np.nan_to_num(zmed)).float()[cn]; self.t7[t][cs] = 0.0; self.dep[t][cs] = 0.0; self.t7[t][cu] = 1.0
+            if self.case_seen: k1 = torch.from_numpy(self.tier_all[t].numpy() == 1); cn = cn & k1; cs = cs & k1; cu = cu & k1
+            self.tier_all[t][cn] = 2.0 if self.coarse else 3.0; self.dep[t][cn] = torch.from_numpy(np.nan_to_num(zmed)).float()[cn]; self.tier_all[t][cs] = 0.0; self.dep[t][cs] = 0.0; self.tier_all[t][cu] = 1.0
             return t, (cn, cs), int(new.sum() + skn.sum())
         _a = _t.time(); nth = int(os.environ.get("PAINT_THREADS", "1"))
         if nth > 1:
@@ -498,9 +498,9 @@ class WorldMaintainer:
 
     def _paint(self, t_from):
         if not self.meshes: return 0
-        T = list(range(t_from, len(self.v7c))); GZ = self._grown(T, fused=True); changed = 0; self.cells = {}
+        T = list(range(t_from, len(self.proxy_v))); GZ = self._grown(T, fused=True); changed = 0; self.cells = {}
         for i, t in enumerate(T):
-            px = self.v7c[t]; free = ((self.Tc[t] != 0) if self.one else (self.Tc[t] == 1)) & ~self.ch[t]
+            px = self.proxy_v[t]; free = ((self.Tc[t] != 0) if self.one else (self.Tc[t] == 1)) & ~self.ch[t]
             new = free & (GZ[i] > 0); p, yw = MV.dir_grid(self.R[t].numpy().astype(float), self.H, self.W, self.f, self.cx, self.cy)
             skn = free & ~new & (self.Tc[t] == 1) & self.sky[p, yw] & (p >= 180)
             if new.any():
@@ -513,7 +513,7 @@ class WorldMaintainer:
             fn = new.reshape(60, 8, 104, 8).mean((1, 3)); fs_ = skn.reshape(60, 8, 104, 8).mean((1, 3))
             zt = np.where(new, GZ[i], np.nan).reshape(60, 8, 104, 8).transpose(0, 2, 1, 3).reshape(60, 104, 64)
             with np.errstate(all="ignore"): zmed = np.nanmedian(zt, -1)
-            cn = torch.from_numpy((fn > 0.5) & ((self.t7[t].numpy() != 0) if self.one else (self.t7[t].numpy() == 1))); cs = torch.from_numpy((fs_ > 0.5) & (self.t7[t].numpy() == 1))
-            self.t7[t][cn] = 3.0; self.dep[t][cn] = torch.from_numpy(np.nan_to_num(zmed)).float()[cn]; self.t7[t][cs] = 0.0; self.dep[t][cs] = 0.0
+            cn = torch.from_numpy((fn > 0.5) & ((self.tier_all[t].numpy() != 0) if self.one else (self.tier_all[t].numpy() == 1))); cs = torch.from_numpy((fs_ > 0.5) & (self.tier_all[t].numpy() == 1))
+            self.tier_all[t][cn] = 3.0; self.dep[t][cn] = torch.from_numpy(np.nan_to_num(zmed)).float()[cn]; self.tier_all[t][cs] = 0.0; self.dep[t][cs] = 0.0
             self.cells[t] = (cn, cs); changed += int(new.sum() + skn.sum())
         return changed
