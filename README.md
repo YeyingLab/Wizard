@@ -117,10 +117,9 @@ DiT checkpoints fine-tuned from Wan2.2-TI2V-5B, in the `weights/` folder of
 | `causal_cd/ema_step10000.safetensors` | 3 · consistency-distilled causal student | `causal` / `world`, 2 steps |
 | `causal_teacher/dit_step11000.safetensors` | 2 · causal teacher | teacher of stage 3 |
 | `bidirectional/dit_step35000.safetensors` | 1 · bidirectional teacher, all data incl. world-edit clips | `bidirectional`, 30 steps, CFG 3 |
-| `bidirectional_main/dit_step35000.safetensors` | 1 · bidirectional teacher of the paper's main table | `bidirectional`, 30 steps, CFG 3 |
 
-The released `causal_cd` / `causal_dmd` come from an earlier run of the chain started from `bidirectional_main`; the
-students distilled from `bidirectional` with the scripts below will replace them.
+The released `causal_cd` / `causal_dmd` come from an earlier run of the chain; the students distilled from
+`bidirectional` with the scripts below will replace them.
 
 **Other base models.** The approach is not tied to Wan: the visual proxy, the reference binding and the training recipe
 carry over to other video backbones. We also trained it on [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) (22B)
