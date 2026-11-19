@@ -1,4 +1,4 @@
-"""Stage 2b: causal teacher forcing with history self-augmentation.
+"""Stage 2 (used, scripts/train/2_causal.sh): causal teacher forcing with history self-augmentation.
 
 Under teacher forcing the clean history already contains almost everything, so the model never learns that memory should correct a
 drifting history. With probability SA_P (the same decision on every rank) the clean history is replaced by the model's own one-step

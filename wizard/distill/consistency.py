@@ -64,6 +64,7 @@ def main():
     ap.add_argument("--group_rep", default="e1o:2,e2o:2,e1n:2,e2n:2,e1x:2,turn:2,roam:2"); ap.add_argument("--rep_mem", type=int, default=0); ap.add_argument("--rep_keys", default="")
     ap.add_argument("--extra_rows", default=""); ap.add_argument("--mem_index", default="mem_index.pt"); ap.add_argument("--p_trueunk", type=float, default=0.0); ap.add_argument("--p_unk2", type=float, default=0.0)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--student_init", default="", help="warm start: student + EMA from this checkpoint, the teacher stays --ckpt"); ap.add_argument("--step0", type=int, default=0, help="step counter starts here (save names continue the old run)")
     a = ap.parse_args()
     a.mem_warp = a.mem_wrope = a.no_coords = a.empty_actor = a.skeleton_depth_cond = a.coords_only = False
     a.p_memunk = 0.0; a.mem_loss_w = 1.0; a.p_text_drop = 0.0; a.p_memnoise = 0.0; a.memnoise = 0.0; a.p_ident = 0.0
@@ -74,7 +75,7 @@ def main():
     log = (lambda *x: (print(*x, flush=True), open(os.path.join(a.out, "train.log"), "a").write(" ".join(map(str, x)) + "\n"))) if main_ else (lambda *x: None)
     models = []
     for _ in range(3):
-        m = A.build_model(a); info = m.load_state_dict(st.load_file(a.ckpt), strict=False)
+        m = A.build_model(a); info = m.load_state_dict(st.load_file(a.student_init if (a.student_init and len(models) < 2) else a.ckpt), strict=False)   # models = [student, ema, teacher]
         bad = [k for k in info.missing_keys if "rope" not in k]; assert not bad and not info.unexpected_keys, (bad[:5], info.unexpected_keys[:5]); models.append(m)
     cores = list(models); student, ema, teacher = models; student.use_gradient_checkpointing = True; ema.use_gradient_checkpointing = False; teacher.use_gradient_checkpointing = False
     rows = [json.loads(l) for l in open(os.path.join(a.data, "rows.jsonl"))]
@@ -86,6 +87,7 @@ def main():
     train = [r for r in rows for _ in range(nrep(r))]
     c = collections.Counter(r["group"] for r in train)
     log(f"CD (teacher cfg {a.cfg}, all window {a.window}+{a.sink}) <- {a.ckpt}; world {accel.num_processes}; N {a.N} lr {a.lr}")
+    if a.student_init: log(f"warm start: student + EMA <- {a.student_init}, step counter from {a.step0}")
     log(f"rows {len(rows)} -> {len(train)}:", {k: f"{v} ({100 * v / len(train):.1f}%)" for k, v in sorted(c.items())})
     ds = A.ARData(a.data, train, a); log(f"SceneFly memory picks kept past-only: {ds.past_info[1]} of {ds.past_info[0]}")
     if main_: json.dump(vars(a), open(os.path.join(a.out, "args.json"), "w"), indent=1)
@@ -98,7 +100,7 @@ def main():
     student, ema, teacher, opt, dl, sch = accel.prepare(student, ema, teacher, opt, dl, sch)
     sched = FlowMatchScheduler(shift=5.0).to(accel.device); sigmas, tsteps = cd_axis(sched, a.N, accel.device)
     idx_rng = torch.Generator(device="cpu").manual_seed(1234 + a.seed)                 # same consistency level on every rank
-    step, t0, it = 0, time.time(), iter(dl); student.train()
+    step, t0, it = a.step0, time.time(), iter(dl); student.train()
     while step < a.max_steps:
         try: b = next(it)
         except StopIteration: it = iter(dl); b = next(it)

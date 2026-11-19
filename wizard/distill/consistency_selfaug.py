@@ -1,4 +1,4 @@
-"""Stage 3 (used): consistency distillation with history self-augmentation.
+"""Stage 3: consistency distillation with history self-augmentation (the released run enters through `wizard.distill.consistency_selfaug_future`).
 
 As `wizard.distill.consistency`, but with probability SA_P the history read by the student and the EMA is replaced by the teacher's
 one-step x0 estimate of a noised copy, while the teacher keeps reading the clean ground-truth history: the student must match the

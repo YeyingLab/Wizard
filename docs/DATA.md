@@ -14,6 +14,7 @@ roam_memory/         roaming memory banks, mem_index*.pt, rep_keys_both30.json
 scenefly/            revisit sequences (SceneFly), rows.jsonl
 scenefly_replay/     revisit sequences replayed backwards, rows.jsonl
 synth_lookback_geo/  synthetic look-back sequences (camera turns away and back), rows_full.jsonl
+worldedit/           world-edit clips (objects / terrain changing in front of the camera), rows_train.jsonl, mem_index.pt, bank/ (read with WEDIT=1)
 ```
 
 Each row belongs to a **group**, used for the mixing weights (`--group_rep group:weight,...`):
@@ -25,6 +26,7 @@ Each row belongs to a **group**, used for the mixing weights (`--group_rep group
 | `roam` | roaming recordings |
 | `sfly`, `sfly_replay`, `lookback`, `lookback0` | revisits: the camera comes back to a place it has seen |
 | `ww`, `er`, `ue`, `bk` | duels |
+| `wedit` | world edits (stages 1 from 3k, 2 and 3) |
 
 The pre-encoded data is released in [`yuzhewu207/wizard-precoded`](https://huggingface.co/datasets/yuzhewu207/wizard-precoded) (the exact files the models were trained on, minus the WildWorld windows; see the WildWorld note in the README): group `ww` has no rows). Restore it with
 

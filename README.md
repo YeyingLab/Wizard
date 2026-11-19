@@ -90,10 +90,9 @@ Each run writes `out.mp4` (generation | proxy) and `out_gen.mp4` (generation onl
 | Stage | Module | Script |
 |---|---|---|
 | 1. Bidirectional teacher | `wizard.train.bidirectional` | `scripts/train/1_bidirectional.sh` |
-| 2. Causal teacher forcing | `wizard.train.causal` | `scripts/train/2_causal.sh` |
-| 2b. History self-augmentation | `wizard.train.causal_selfaug` | `scripts/train/3_causal_selfaug.sh` |
-| 3. Consistency distillation | `wizard.distill.consistency_selfaug` | `scripts/train/4_consistency.sh` |
-| 4. Distribution matching distillation | `wizard.distill.dmd` | `scripts/train/5_dmd.sh` |
+| 2. Causal teacher (teacher forcing + history self-augmentation) | `wizard.train.causal_selfaug` | `scripts/train/2_causal.sh` |
+| 3. Consistency distillation | `wizard.distill.consistency_selfaug_future` | `scripts/train/3_consistency.sh` |
+| 4. Distribution matching distillation | `wizard.distill.dmd` | `scripts/train/4_dmd.sh` |
 
 Commands, hyper-parameters and the data layout: [docs/TRAINING.md](docs/TRAINING.md) and [docs/DATA.md](docs/DATA.md).
 
@@ -103,8 +102,8 @@ All weights are DiT checkpoints fine-tuned from Wan2.2-TI2V-5B (the VAE and T5 a
 
 | File | Model | Sampling |
 |---|---|---|
-| `causal_dmd/ema_step480.safetensors` | real-time 2-step student (stage 4, DMD) | `causal` / `world`, 2 steps |
-| `causal_cd/ema_step10000.safetensors` | consistency-distilled student (stage 3), the starting point of DMD | `causal` / `world`, 2 steps |
+| `causal_dmd/ema_step480.safetensors` | real-time 2-step student (stage 4, DMD), distilled from `bidirectional_main` (an earlier run of the chain; the student trained with the scripts below from `bidirectional` will replace it) | `causal` / `world`, 2 steps |
+| `causal_cd/ema_step10000.safetensors` | consistency-distilled student (stage 3) of that earlier run, the starting point of its DMD | `causal` / `world`, 2 steps |
 | `causal_teacher/dit_step11000.safetensors` | causal teacher (stage 2) | teacher of stage 3 |
 | `bidirectional_main/dit_step35000.safetensors` | bidirectional teacher (stage 1), the model of the paper's main table | `bidirectional`, 30 steps, CFG 3 |
 | `bidirectional/dit_step35000.safetensors` | bidirectional teacher trained with the world-edit clips as well | `bidirectional`, 30 steps, CFG 3 |

@@ -5,7 +5,10 @@ channels, world-coordinate tokens on background cells, retrieved memory frames a
 dataset (`ClipDataset`), `collate` and the data-root constants used by the later stages.
 
     accelerate launch --config_file configs/accelerate/fsdp.yaml --num_processes 8 -m wizard.train.bidirectional \
-        --data $WIZARD_DATA/windows --out runs/bidir [data / mixing arguments]"""
+        --data $WIZARD_DATA/windows --out runs/bidir [data / mixing arguments]
+
+Environment: UNK_NOCOORD=1 (unknown cells carry no coordinate token), MEMW_COVER / MEMW_HISTW / MEMW_SINK (which cells get the memory
+loss weight), WEDIT=1 (add the world-edit windows of worldedit/: their memory index and banks; rows via --extra_rows)."""
 import os, sys, time, argparse, json, random, collections, math
 import numpy as np
 import torch, torch.nn.functional as F
@@ -80,6 +83,8 @@ class ClipDataset(torch.utils.data.Dataset):
         for root in (SFLY, SFLY + "_replay", SFLY + "_replay_test"):                                             # replay windows read the same videos' banks (in scenefly)
             if os.path.exists(f"{root}/mem_index.pt"):
                 si = lt(f"{root}/mem_index.pt"); self.mem_index.update(si); self.mroot.update({v["seg"]: SFLY for v in si.values()})
+        if os.environ.get("WEDIT") == "1" and os.path.exists(f"{DS}/worldedit/mem_index.pt"):   # WEDIT=1: the world-edit windows (group wedit), memroam layout under their own root, own banks
+            si = lt(f"{DS}/worldedit/mem_index.pt"); self.mem_index.update(si); self.mroot.update({v["seg"]: f"{DS}/worldedit" for v in si.values()})
         self.with_prev = [i for i, r in enumerate(rows) if r["prev"]]
 
     def __len__(self): return len(self.rows)
@@ -119,7 +124,7 @@ class ClipDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, i):
         r = self.rows[i]; a = self.a
-        if r["group"] in ("roam", "sfly", "sfly_replay"): return self.roam(r)                             # SceneFly = roam layout, no characters
+        if r["group"] in ("roam", "sfly", "sfly_replay", "wedit"): return self.roam(r)                             # SceneFly / world edit = roam layout, no characters
         c = lt(f"{DS}/samples/clips/clip_{r['key']}.pt"); g = lt(f"{self.O}/geometry/clip_{r['key']}.pt"); pv = lt(f"{PROXY}/clip_{r['key']}.pt"); act = pv["cond"] if not os.environ.get("SKELETON_DEPTH_COND") else c["cond"]
         u2 = f"{PROXY}_unk2/clip_{r['key']}.pt"
         if getattr(a, "p_unk2", 0.0) > 0 and os.path.exists(u2) and random.random() < a.p_unk2: pv = lt(u2); act = pv["cond"]   # unk2_build.py
