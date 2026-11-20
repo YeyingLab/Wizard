@@ -1,6 +1,6 @@
 """Stage 3 entry point of the released chain: `wizard.distill.consistency_selfaug` with PAST + FUTURE memory candidates, as the
 causal teacher was trained (`wizard.train.causal_selfaug` with MEM_FUTURE=1): SceneFly forward windows keep memory picks >= 3 s before
-the window or >= 3 s after its end. `wizard.distill.consistency` alone (and `wizard.distill.dmd`) use `wizard.train.causal.ARData`
+the window or >= 3 s after its end. `wizard.distill.consistency` alone and `wizard.distill.dmd` alone use `wizard.train.causal.ARData`
 = past only. Inference is unchanged (past memory only). Also a free-disk guard for the periodic EMA saves (CD_FREE_GB, default 15):
 an intermediate save is skipped rather than crash, the last one waits for space.
    arguments and environment exactly as wizard.distill.consistency_selfaug"""

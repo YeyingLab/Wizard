@@ -27,7 +27,7 @@ and was then warm-started from its 2k EMA (`STUDENT_INIT`, `STEP0=2000`, `SEED=1
 | 1. Bidirectional | 35k | 8 | 1e-5 (condition layers 1e-4) | unknown cells without coordinates, `p_unk2 0.5`, memory loss weight 3; world-edit clips (`WEDIT=1`) |
 | 2. Causal teacher | 11k | 8 | 1e-5 (condition layers 1e-5) | history window 20 + sink 1; history self-augmentation `SA_P 0.5 / SA_MAX 0.25` on revisit clips; memory from before and after the window |
 | 3. Consistency distillation | 10k | 8 | 2e-6, EMA 0.99 | N = 48 levels, 2 sampling steps (1000, 500), teacher CFG 3, `SA_P 0.7 / SA_MAX 0.5`; memory before and after the window |
-| 4. DMD | 500 | 32 (8 × accum 4) | 2e-6 / critic 4e-7 | critic : student = 5 : 1, real score = the stage-1 model with CFG 3; memory from the past only, no world-edit clips |
+| 4. DMD | 500 | 32 (8 × accum 4) | 2e-6 / critic 4e-7 | critic : student = 5 : 1, real score = the stage-1 model with CFG 3; memory from the past and the future as stages 2–3 (`wizard.distill.dmd_future`), no world-edit clips |
 
 Hyper-parameters not set in the scripts keep the defaults of each module's argument parser.
 

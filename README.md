@@ -118,8 +118,8 @@ DiT checkpoints fine-tuned from Wan2.2-TI2V-5B, in the `weights/` folder of
 | `causal_teacher/dit_step11000.safetensors` | 2 · causal teacher | teacher of stage 3 |
 | `bidirectional/dit_step35000.safetensors` | 1 · bidirectional teacher, all data incl. world-edit clips | `bidirectional`, 30 steps, CFG 3 |
 
-The released `causal_cd` / `causal_dmd` come from an earlier run of the chain; the students distilled from
-`bidirectional` with the scripts below will replace them.
+`causal_cd` is the consistency student of the released chain (stage 3 run from `causal_teacher` with the scripts below).
+`causal_dmd` still comes from an earlier run of the chain; the DMD student distilled from this `causal_cd` will replace it.
 
 **Other base models.** The approach is not tied to Wan: the visual proxy, the reference binding and the training recipe
 carry over to other video backbones. We also trained it on [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) (22B)
@@ -172,7 +172,7 @@ bash scripts/train/4_dmd.sh runs/cd/ema/ema_step10000.safetensors \
 | 1 · bidirectional teacher | `wizard.train.bidirectional` | `scripts/train/1_bidirectional.sh` |
 | 2 · causal teacher (teacher forcing + history self-augmentation) | `wizard.train.causal_selfaug` | `scripts/train/2_causal.sh` |
 | 3 · consistency distillation | `wizard.distill.consistency_selfaug_future` | `scripts/train/3_consistency.sh` |
-| 4 · distribution matching distillation | `wizard.distill.dmd` | `scripts/train/4_dmd.sh` |
+| 4 · distribution matching distillation | `wizard.distill.dmd_future` | `scripts/train/4_dmd.sh` |
 
 Every stage can start from the released checkpoint of the previous one. Hyper-parameters, resuming and environment
 switches: [docs/TRAINING.md](docs/TRAINING.md).
