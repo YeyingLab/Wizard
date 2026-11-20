@@ -70,7 +70,7 @@ generator on.
 ## Installation
 
 ```bash
-git clone https://github.com/wyzardWu/wizard27-clean.git && cd wizard27-clean
+git clone https://github.com/YeyingLab/Wizard.git && cd Wizard
 conda create -n wizard python=3.12 -y && conda activate wizard
 pip install torch==2.11.0 torchvision --index-url https://download.pytorch.org/whl/cu128
 pip install -r requirements.txt
