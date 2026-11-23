@@ -93,7 +93,7 @@ huggingface-cli download yuzhewu207/wizard --repo-type dataset \
 C=hf_wizard/examples/fight_character_strikes_player
 
 # real-time 2-step causal student
-FRAMES=121 bash scripts/infer/run_case.sh causal hf_wizard/weights/causal_dmd/ema_step480.safetensors $C out.mp4 \
+FRAMES=121 bash scripts/infer/run_case.sh causal hf_wizard/weights/causal_dmd/ema_step200.safetensors $C out.mp4 \
     --ref1 $C/ref_a.png --ref2 $C/ref_b.png --ref-slots 2,3
 
 # the same with an online-maintained 3D world (the case needs world_px.npz); FAST=1 runs the maintenance on the second GPU
@@ -113,13 +113,15 @@ DiT checkpoints fine-tuned from Wan2.2-TI2V-5B, in the `weights/` folder of
 
 | Checkpoint | Stage | Sampling |
 |---|---|---|
-| `causal_dmd/ema_step480.safetensors` | 4 · real-time causal student (DMD) | `causal` / `world`, 2 steps |
+| `causal_dmd/ema_step200.safetensors` | 4 · real-time causal student (DMD of `causal_cd`, 200 steps, interim) | `causal` / `world`, 2 steps |
+| `causal_dmd/ema_step480.safetensors` | 4 · DMD student from an earlier run of the chain, kept for comparison | `causal` / `world`, 2 steps |
 | `causal_cd/ema_step10000.safetensors` | 3 · consistency-distilled causal student | `causal` / `world`, 2 steps |
 | `causal_teacher/dit_step11000.safetensors` | 2 · causal teacher | teacher of stage 3 |
 | `bidirectional/dit_step35000.safetensors` | 1 · bidirectional teacher, all data incl. world-edit clips | `bidirectional`, 30 steps, CFG 3 |
 
 `causal_cd` is the consistency student of the released chain (stage 3 run from `causal_teacher` with the scripts below).
-`causal_dmd` still comes from an earlier run of the chain; the DMD student distilled from this `causal_cd` will replace it.
+`causal_dmd/ema_step200` is the DMD student of this `causal_cd` after 200 of 500 planned steps (world-edit clips join the DMD data from
+step 201); the final checkpoint will replace it. `ema_step480` comes from an earlier run of the chain.
 
 **Other base models.** The approach is not tied to Wan: the visual proxy, the reference binding and the training recipe
 carry over to other video backbones. We also trained it on [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) (22B)
