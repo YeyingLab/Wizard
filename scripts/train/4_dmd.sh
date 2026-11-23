@@ -2,7 +2,7 @@
 # Stage 4: DMD of the 2-step student; real score and the fake score's start = the bidirectional teacher (CFG 3). Batch = 8 GPUs x accum 4 = 32,
 # lr 2e-6 / critic 4e-7, 5 critic updates per student update, levels 1000,500. Memory candidates past + future as the teacher and the
 # consistency student (wizard.distill.dmd_future, mem_index_both.pt), the world-edit clips (WEDIT=1, repeated 16x), heavier mixing of the entry /
-# revisit groups. (Our released run had no world-edit clips for its first 200 steps; they joined from step 201 with this mix.)
+# revisit groups.
 #   bash scripts/train/4_dmd.sh <consistency ema_step10000> <bidirectional dit_step35000> <out dir> [max steps]
 # Ours: 500 steps, saving every 50 (an EMA, student_last and fake_last each time). To continue a run from its save at step N:
 #   EXTRA="--ema_init <out>/ema/ema_step<N>.safetensors --fake <out>/fake_last.safetensors --step0 <N>" \
