@@ -6,7 +6,8 @@ memory, real score with CFG. Critic : student updates = 5 : 1, gradient accumula
 
     accelerate launch --config_file configs/accelerate/fsdp_dmd.yaml --num_processes 8 -m wizard.distill.dmd \
         --data $WIZARD_DATA/windows --student <cd ema> --real <bidirectional dit> --out runs/dmd --accum 4 --cfg 3
-    resume: --student <dmd ema> --fake <runs/dmd/fake_last.safetensors> --step0 <step>"""
+    resume: --student <runs/dmd/student_last.safetensors> --ema_init <runs/dmd/ema/ema_step<N>.safetensors> \
+            --fake <runs/dmd/fake_last.safetensors> --step0 <N>"""
 import os, sys, glob, json, time, argparse, random, collections
 import torch
 import torch.nn.functional as F
@@ -131,7 +132,7 @@ def main():
     ap.add_argument("--out", required=True); ap.add_argument("--levels", default="1000,500", help="the student's sampling levels, e.g. 1000,500")
     ap.add_argument("--cfg", type=float, default=3.0, help="guidance of the real score (the bidirectional model is sampled at 3)")
     ap.add_argument("--lr", type=float, default=2e-6); ap.add_argument("--lr_critic", type=float, default=4e-7); ap.add_argument("--critic_steps", type=int, default=5, help="critic updates per student update")
-    ap.add_argument("--max_steps", type=int, default=400, help="STUDENT updates"); ap.add_argument("--step0", type=int, default=0, help="step count to continue from"); ap.add_argument("--fake", default="", help="fake score init, default = --real"); ap.add_argument("--warmup", type=int, default=20)
+    ap.add_argument("--max_steps", type=int, default=400, help="STUDENT updates"); ap.add_argument("--step0", type=int, default=0, help="step count to continue from"); ap.add_argument("--fake", default="", help="fake score init, default = --real"); ap.add_argument("--ema_init", default="", help="EMA init when resuming, default = --student"); ap.add_argument("--warmup", type=int, default=20)
     ap.add_argument("--ema_decay", type=float, default=0.99); ap.add_argument("--ema_start", type=int, default=20)
     ap.add_argument("--windowed_train", type=int, default=20); ap.add_argument("--windowed_sink", type=int, default=1)
     ap.add_argument("--save_every", type=int, default=25); ap.add_argument("--log_every", type=int, default=1); ap.add_argument("--num_workers", type=int, default=4)
@@ -145,7 +146,7 @@ def main():
     accel = Accelerator(step_scheduler_with_optimizer=False); set_seed(a.seed, device_specific=True); random.seed(a.seed + accel.process_index); main_ = accel.is_main_process; os.makedirs(a.out, exist_ok=True)
     log = (lambda *x: (print(*x, flush=True), open(os.path.join(a.out, "train.log"), "a").write(" ".join(map(str, x)) + "\n"))) if main_ else (lambda *x: None)
     levels = [float(v) for v in a.levels.split(",")]
-    student = A.build_model(a); load(student, a.student); ema = A.build_model(a); load(ema, a.student)           # causal + proxy + world tokens, window / sink
+    student = A.build_model(a); load(student, a.student); ema = A.build_model(a); load(ema, a.ema_init or a.student)           # causal + proxy + world tokens, window / sink
     real = WizardDiT(**ti2v_5b_config(), causal=False, zero_init_head=False); attach_cond(real); attach_world(real); load(real, a.real)
     fake = WizardDiT(**ti2v_5b_config(), causal=False, zero_init_head=False); attach_cond(fake); attach_world(fake); load(fake, a.fake or a.real)
     real_core, fake_core = real, fake                                                    # _gb_in lives on the bare modules
