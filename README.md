@@ -87,14 +87,16 @@ export WAN_CKPT=$PWD/checkpoints/Wan2.2-TI2V-5B      # the VAE, T5 and tokenizer
 ## Quick start
 
 ```bash
-# the real-time model and three ready-made cases (first frame, proxy video, reference images, our outputs)
+# the real-time model and five ready-made cases (first frame, proxy video, reference images, our outputs)
 huggingface-cli download yuzhewu207/wizard --repo-type dataset \
-    --include "weights/causal_dmd/*" "examples/*" --local-dir hf_wizard
-C=hf_wizard/examples/fight_character_strikes_player
+    --include "weights/causal_dmd/ema_step300.safetensors" "examples/*" --local-dir hf_wizard
+W=hf_wizard/weights/causal_dmd/ema_step300.safetensors
 
-# real-time 2-step causal student
-FRAMES=121 bash scripts/infer/run_case.sh causal hf_wizard/weights/causal_dmd/ema_step300.safetensors $C out.mp4 \
-    --ref1 $C/ref_a.png --ref2 $C/ref_b.png --ref-slots 2,3
+# real-time 2-step causal student: an 8 s duel with a character already in the first frame, and an 8 s world edit
+C=hf_wizard/examples/duel_bull_character
+bash scripts/infer/run_case.sh causal $W $C out.mp4 --ref1 $C/ref_a.png --ref-slots 2,0
+C=hf_wizard/examples/world_edit_stairs
+bash scripts/infer/run_case.sh causal $W $C out.mp4 --ref-slots 0,0
 
 # the same with an online-maintained 3D world (the case needs world_px.npz); FAST=1 runs the maintenance on the second GPU
 CUDA_VISIBLE_DEVICES=0,1 FAST=1 bash scripts/infer/run_case.sh world <dit> <case> out.mp4
