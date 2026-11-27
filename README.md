@@ -127,8 +127,9 @@ DiT checkpoints fine-tuned from Wan2.2-TI2V-5B, in the `weights/` folder of
 **Other base models.** The approach is not tied to Wan: the visual proxy, the reference binding and the training recipe
 carry over to other video backbones. We also trained it on [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) (22B)
 as a LoRA: [`weights/ltx25_lora/`](https://huggingface.co/datasets/yuzhewu207/wizard/tree/main/weights/ltx25_lora)
-(an earlier proxy format without tiers or memory; its inference code, a modified LTX-2 pipeline with the
-reference-image conditioning, is not part of this repository).
+(an earlier proxy format without tiers or memory). Its inference code, a patch to LTX-2 with the reference-image
+binding plus a runner, is in [`ltx/`](ltx/README.md) with three ready-made cases; that folder and the LoRA are under the
+LTX-2.x Community License.
 
 ## Data
 

@@ -1,0 +1,2493 @@
+diff --git a/packages/ltx-core/src/ltx_core/model/transformer/attention.py b/packages/ltx-core/src/ltx_core/model/transformer/attention.py
+index 8a38552..65b9737 100644
+--- a/packages/ltx-core/src/ltx_core/model/transformer/attention.py
++++ b/packages/ltx-core/src/ltx_core/model/transformer/attention.py
+@@ -1,3 +1,5 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
+ import functools
+ import sys
+ from dataclasses import dataclass, field
+@@ -7,6 +9,7 @@ from typing import Protocol
+ import torch
+ from torch.nn.attention import SDPBackend, sdpa_kernel
+ 
++from ltx_core.model.transformer.kv_cache import KVCacheView
+ from ltx_core.model.transformer.ops import (
+     GatedAttentionCallable,
+     PreAttentionCallable,
+@@ -526,6 +529,7 @@ class Attention(torch.nn.Module):
+         k_pe: torch.Tensor | None = None,
+         perturbation_mask: torch.Tensor | None = None,
+         all_perturbed: bool = False,
++        kv_cache: "KVCacheView | None" = None,
+     ) -> torch.Tensor:
+         """Multi-head attention with optional RoPE, perturbation masking, and per-head gating.
+         When ``perturbation_mask`` is all zeros, the expensive query/key path
+@@ -564,10 +568,19 @@ class Attention(torch.nn.Module):
+             q = self.to_q(x)
+             k = self.to_k(context)
+             q, k = self.preattention_function(q, k, self, mask, pe, k_pe)
++            k_attn, v_attn = k, v
++            if kv_cache is not None:
++                # Streaming path: ``x`` holds only the new tokens. Cached keys are
++                # already normalised and rotated (they were produced by this same
++                # branch), so they concatenate in front of the fresh ones. The
++                # cache is read before it is written so a view whose write target
++                # is also a read source does not see the new tokens twice.
++                k_attn, v_attn = kv_cache.gather(k, v)
++                kv_cache.commit(k, v)
+             if mask is None:
+-                out = self.attention_function(q, k, v, self.heads)  # (B, T, H*D)
++                out = self.attention_function(q, k_attn, v_attn, self.heads)  # (B, T, H*D)
+             else:
+-                out = self.masked_attention_function(q, k, v, self.heads, mask)
++                out = self.masked_attention_function(q, k_attn, v_attn, self.heads, mask)
+ 
+             if perturbation_mask is not None:
+                 out = out * perturbation_mask + v * (1 - perturbation_mask)
+diff --git a/packages/ltx-core/src/ltx_core/model/transformer/kv_cache.py b/packages/ltx-core/src/ltx_core/model/transformer/kv_cache.py
+new file mode 100644
+index 0000000..d51d076
+--- /dev/null
++++ b/packages/ltx-core/src/ltx_core/model/transformer/kv_cache.py
+@@ -0,0 +1,138 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
++"""Per-layer K/V caches for chunk-causal streaming inference.
++
++What is cached
++--------------
++For one ``Attention`` layer, the keys *after* ``k_norm`` + RoPE and the raw
++values of tokens that are already final (clean, timestep 0). Because LTX RoPE
++is purely relative in ``q·k`` (``rope.py``: ``freqs = idx * (pos/max_pos*2-1)``,
++no clamping), cached keys carry their own absolute positions and stay valid as
++the timeline grows; only the *relative* span between a query and its oldest
++cached key must stay inside the span seen in training, which ``evict_front``
++maintains for a sliding window.
++
++Why a view with separate read sources and a write target
++--------------------------------------------------------
++Under the block-causal mask the white-box reference tokens never attend to the
++target tokens, while target tokens attend to both. Instead of a mask, the
++streaming loop runs each new frame as two sub-passes:
++
++    reference frame f : reads [reference cache]              writes reference cache
++    target    frame f : reads [reference cache, target cache] writes target cache (only once clean)
++
++Attention itself never sees a mask on this path, so it runs on the unmasked
++flash kernel; the causal structure is entirely in what each view can read.
++"""
++
++from __future__ import annotations
++
++import torch
++
++__all__ = ["LayerKVCache", "KVCacheView"]
++
++
++class LayerKVCache:
++    """K/V store for a single attention layer, tokens appended in stream order."""
++
++    def __init__(self) -> None:
++        self._k: list[torch.Tensor] = []  # each (B, T_i, H*D), post-norm, post-RoPE
++        self._v: list[torch.Tensor] = []  # each (B, T_i, H*D), raw values
++
++    @property
++    def num_tokens(self) -> int:
++        return sum(t.shape[1] for t in self._k)
++
++    def append(self, k: torch.Tensor, v: torch.Tensor) -> None:
++        self._k.append(k.detach())
++        self._v.append(v.detach())
++
++    def evict_front(self, num_tokens: int) -> None:
++        """Drop the oldest ``num_tokens`` tokens (sliding window)."""
++        while num_tokens > 0 and self._k:
++            t = self._k[0].shape[1]
++            if t <= num_tokens:
++                self._k.pop(0)
++                self._v.pop(0)
++                num_tokens -= t
++            else:
++                self._k[0] = self._k[0][:, num_tokens:]
++                self._v[0] = self._v[0][:, num_tokens:]
++                num_tokens = 0
++
++    def evict_range(self, start: int, num_tokens: int) -> None:
++        """Drop ``num_tokens`` tokens beginning at token offset ``start`` (used to pin a sink frame at 0)."""
++        k = torch.cat(self._k, dim=1); v = torch.cat(self._v, dim=1)
++        keep = torch.ones(k.shape[1], dtype=torch.bool, device=k.device); keep[start:start + num_tokens] = False
++        self._k = [k[:, keep]]; self._v = [v[:, keep]]
++
++    def clear(self) -> None:
++        self._k.clear()
++        self._v.clear()
++
++    def tensors(self) -> tuple[list[torch.Tensor], list[torch.Tensor]]:
++        return self._k, self._v
++
++
++class KVCacheView:
++    """What an ``Attention`` layer is handed for one sub-pass.
++
++    ``read`` caches are concatenated (in the given order) in front of the new
++    tokens' K/V; ``write`` receives the new tokens' K/V after the attention
++    call, or nothing when ``None`` (e.g. a noisy target pass mid-denoising).
++    """
++
++    def __init__(
++        self,
++        read: list[LayerKVCache],
++        write: LayerKVCache | None = None,
++        read_limits: list[int | None] | None = None,
++        read_ranges: list[list[tuple[int, int]] | None] | None = None,
++    ) -> None:
++        self.read = read
++        self.write = write
++        # Optional per-read-cache cap on how many of its oldest tokens are visible. Lets a cache that
++        # already holds a whole (block-causal) reference stream be read "aligned" -- only frames <= f --
++        # without re-committing it frame by frame.
++        self.read_limits = read_limits
++        # Optional per-read-cache list of token ranges [start, end) to gather, in order (e.g. a pinned sink
++        # frame plus a sliding window). Ranges are applied to the cache's full token stream; empty ranges are
++        # skipped. Takes precedence over ``read_limits`` for that cache. Used by cache-aware training, where
++        # one pass holds several query frames and the (rectangular) attention mask does the per-query part.
++        self.read_ranges = read_ranges
++
++    def gather(self, k_new: torch.Tensor, v_new: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
++        ks: list[torch.Tensor] = []
++        vs: list[torch.Tensor] = []
++        for i, c in enumerate(self.read):
++            k_list, v_list = c.tensors()
++            ranges = self.read_ranges[i] if self.read_ranges is not None else None
++            if ranges is not None:
++                if k_list:
++                    k_cat = torch.cat(k_list, dim=1) if len(k_list) > 1 else k_list[0]
++                    v_cat = torch.cat(v_list, dim=1) if len(v_list) > 1 else v_list[0]
++                    for s, e in ranges:
++                        e = min(e, k_cat.shape[1])
++                        if e > s:
++                            ks.append(k_cat[:, s:e])
++                            vs.append(v_cat[:, s:e])
++                continue
++            limit = self.read_limits[i] if self.read_limits is not None else None
++            if limit is not None and k_list:
++                k_cat = torch.cat(k_list, dim=1)[:, :limit]
++                v_cat = torch.cat(v_list, dim=1)[:, :limit]
++                if k_cat.shape[1] > 0:
++                    ks.append(k_cat)
++                    vs.append(v_cat)
++                continue
++            ks.extend(k_list)
++            vs.extend(v_list)
++        ks.append(k_new)
++        vs.append(v_new)
++        if len(ks) == 1:
++            return k_new, v_new
++        return torch.cat(ks, dim=1), torch.cat(vs, dim=1)
++
++    def commit(self, k_new: torch.Tensor, v_new: torch.Tensor) -> None:
++        if self.write is not None:
++            self.write.append(k_new, v_new)
+diff --git a/packages/ltx-core/src/ltx_core/model/transformer/modality.py b/packages/ltx-core/src/ltx_core/model/transformer/modality.py
+index 872307d..4c61514 100644
+--- a/packages/ltx-core/src/ltx_core/model/transformer/modality.py
++++ b/packages/ltx-core/src/ltx_core/model/transformer/modality.py
+@@ -1,3 +1,5 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
+ from __future__ import annotations
+ 
+ import dataclasses
+@@ -61,6 +63,11 @@ class Modality:
+     context_mask: torch.Tensor | None = None
+     attention_mask: torch.Tensor | None = None
+     keyframes_mask: torch.Tensor | None = None  # Shape: (B, T, 1), non-zero on single-pixel-frame latents
++    # Streaming inference only: per-layer list of KVCacheView (see model/transformer/kv_cache.py).
++    # None in training and in ordinary full-window inference.
++    kv_caches: object | None = None
++    r_timesteps: torch.Tensor | None = None  # Shape: (B, T). AnyFlow flow-map endpoint timestep per token; None = plain diffusion (r = t)
++    slot_ids: torch.Tensor | None = None  # Shape: (B, T) long. Entity slot per token (0 = none); adds the model's slot embedding (enable_slot_embedding)
+ 
+     def split(self, sizes: list[int]) -> list[Modality]:
+         """Split along the batch dimension into chunks of the given sizes."""
+@@ -72,6 +79,9 @@ class Modality:
+                 split_fields[f.name] = list(value.split(sizes, dim=0))
+             elif value is None or isinstance(value, bool):
+                 split_fields[f.name] = [value] * n
++            elif f.name == "kv_caches":
++                # Per-layer cache views are batch-agnostic objects: share them across the split.
++                split_fields[f.name] = [value] * n
+             else:
+                 raise TypeError(f"Cannot split field {f.name!r}: unsupported type {type(value)}")
+         return [Modality(**{name: parts[i] for name, parts in split_fields.items()}) for i in range(n)]
+diff --git a/packages/ltx-core/src/ltx_core/model/transformer/model.py b/packages/ltx-core/src/ltx_core/model/transformer/model.py
+index dc00164..7308f96 100644
+--- a/packages/ltx-core/src/ltx_core/model/transformer/model.py
++++ b/packages/ltx-core/src/ltx_core/model/transformer/model.py
+@@ -1,3 +1,6 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
++import dataclasses
+ import logging
+ from enum import Enum
+ 
+@@ -457,6 +460,9 @@ class LTXModel(torch.nn.Module, Disposable):
+                     cross_attn_type=PerturbationType.SKIP_V2A_CROSS_ATTN,
+                 )
+ 
++            if video is not None and getattr(video, "kv_caches", None) is not None:
++                # Streaming inference: hand this block its own K/V cache view.
++                video = dataclasses.replace(video, kv_cache=video.kv_caches[block_idx])
+             if self._enable_gradient_checkpointing and self.training:
+                 video, audio = torch.utils.checkpoint.checkpoint(
+                     block,
+@@ -489,6 +495,30 @@ class LTXModel(torch.nn.Module, Disposable):
+         x = proj_out(x)
+         return x
+ 
++    def enable_anyflow(self, gate: float = 0.25) -> None:
++        """AnyFlow flow-map conditioning: add ``delta_adaln_single`` (a copy of ``adaln_single``, so an untrained
++        model with r = t is bit-identical to the plain model) and mix its embedding of the endpoint timestep r
++        into the timestep conditioning with a constant gate. Pass ``r_timesteps`` on the video Modality to use it."""
++        import copy as _copy
++
++        if not hasattr(self, "delta_adaln_single"):
++            self.delta_adaln_single = _copy.deepcopy(self.adaln_single)
++        self.anyflow_gate = float(gate)
++        pre = self.video_args_preprocessor
++        simple = getattr(pre, "simple_preprocessor", pre)
++        simple.delta_adaln = self.delta_adaln_single
++        simple.anyflow_gate = float(gate)
++
++    def enable_slot_embedding(self, num_slots: int) -> None:
++        """Entity-slot embedding (reference <-> stick figure binding): a zero-initialised (num_slots + 1, D) table added right after
++        patchify_proj to every token whose Modality.slot_ids > 0 -- untrained it is an exact no-op. Row 0 is never used."""
++        if not hasattr(self, "slot_embedding"):
++            self.slot_embedding = torch.nn.Parameter(torch.zeros(int(num_slots) + 1, self.inner_dim, dtype=self.patchify_proj.weight.dtype,
++                                                                 device=self.patchify_proj.weight.device))
++        pre = self.video_args_preprocessor
++        simple = getattr(pre, "simple_preprocessor", pre)
++        simple.slot_embedding_provider = lambda: self.slot_embedding
++
+     def forward(
+         self, video: Modality | None, audio: Modality | None, perturbations: BatchedPerturbationConfig | None
+     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+diff --git a/packages/ltx-core/src/ltx_core/model/transformer/transformer.py b/packages/ltx-core/src/ltx_core/model/transformer/transformer.py
+index 1d874f1..353c4ab 100644
+--- a/packages/ltx-core/src/ltx_core/model/transformer/transformer.py
++++ b/packages/ltx-core/src/ltx_core/model/transformer/transformer.py
+@@ -1,3 +1,5 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
+ from dataclasses import dataclass, field, replace
+ 
+ import torch
+@@ -281,6 +283,7 @@ class BasicAVTransformerBlock(torch.nn.Module):
+                 mask=video.self_attention_mask,
+                 perturbation_mask=video.self_attn_perturbation_mask,
+                 all_perturbed=video.self_attn_all_perturbed,
++                kv_cache=video.kv_cache,
+             )
+             vx, vx_normed = self.post_sa_function(vx, vx_msa_out, None, self.norm_eps, vgate_msa)
+             del vgate_msa, norm_vx, vx_msa_out
+diff --git a/packages/ltx-core/src/ltx_core/model/transformer/transformer_args.py b/packages/ltx-core/src/ltx_core/model/transformer/transformer_args.py
+index 566bbd3..f0b7c2a 100644
+--- a/packages/ltx-core/src/ltx_core/model/transformer/transformer_args.py
++++ b/packages/ltx-core/src/ltx_core/model/transformer/transformer_args.py
+@@ -1,3 +1,5 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
+ from collections.abc import Callable, Hashable
+ from dataclasses import dataclass, replace
+ 
+@@ -68,6 +70,12 @@ class TransformerArgs:
+     self_attn_all_perturbed: bool = False
+     cross_attn_perturbation_mask: torch.Tensor | None = None
+     cross_attn_skip_all: bool = False
++    # Streaming inference only. ``kv_caches`` is the per-layer list handed in via
++    # ``Modality.kv_caches``; ``LTXModel._process_transformer_blocks`` selects this
++    # block's entry into ``kv_cache`` before each block runs. Both stay None in
++    # training and in ordinary full-window inference.
++    kv_caches: object | None = None
++    kv_cache: object | None = None
+ 
+ 
+ class BlockPerturbationsProcessor:
+@@ -169,16 +177,31 @@ class TransformerArgsPreprocessor:
+         self.caption_projection = caption_projection
+         self.prompt_adaln = prompt_adaln
+         self.keyframes_embedding_provider = keyframes_embedding_provider
++        # AnyFlow (SolarWM TF-AnyFlow style): a second AdaLN-single for the endpoint timestep r, mixed with the
++        # t embedding by a constant gate. Set by LTXModel.enable_anyflow(); None keeps the model exactly as before.
++        self.delta_adaln: AdaLayerNormSingle | None = None
++        self.anyflow_gate: float = 0.0
+ 
+     def _prepare_timestep(
+-        self, timestep: torch.Tensor, adaln: AdaLayerNormSingle, batch_size: int, hidden_dtype: torch.dtype
++        self,
++        timestep: torch.Tensor,
++        adaln: AdaLayerNormSingle,
++        batch_size: int,
++        hidden_dtype: torch.dtype,
++        r_timestep: torch.Tensor | None = None,
+     ) -> tuple[torch.Tensor, torch.Tensor]:
+-        """Prepare timestep embeddings."""
++        """Prepare timestep embeddings (optionally mixed with the AnyFlow endpoint-timestep embedding)."""
+         timestep_scaled = timestep * self.timestep_scale_multiplier
+         timestep, embedded_timestep = adaln(
+             timestep_scaled.flatten(),
+             hidden_dtype=hidden_dtype,
+         )
++        if r_timestep is not None and self.delta_adaln is not None and adaln is self.adaln:
++            r_scaled = r_timestep * self.timestep_scale_multiplier
++            r_ts, r_emb = self.delta_adaln(r_scaled.flatten(), hidden_dtype=hidden_dtype)
++            g = self.anyflow_gate
++            timestep = (1.0 - g) * timestep + g * r_ts
++            embedded_timestep = (1.0 - g) * embedded_timestep + g * r_emb
+         # Second dimension is 1 or number of tokens (if timestep_per_token)
+         timestep = timestep.view(batch_size, -1, timestep.shape[-1])
+         embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
+@@ -267,9 +290,14 @@ class TransformerArgsPreprocessor:
+     ) -> TransformerArgs:
+         x = self.patchify_proj(modality.latent)
+         x = apply_keyframes_absolute_embedding(x, modality.keyframes_mask, self.keyframes_embedding_provider)
++        sid, sprov = getattr(modality, "slot_ids", None), getattr(self, "slot_embedding_provider", None)
++        if sid is not None and sprov is not None:                                    # entity-slot binding: the same learned vector on a
++            emb = sprov()                                                            # reference's tokens and on its stick figure's tokens
++            x = x + (emb[sid.clamp(min=0)] * (sid > 0).unsqueeze(-1)).to(dtype=x.dtype)   # slot 0 = no slot, exactly nothing added
+         batch_size = x.shape[0]
+         timestep, embedded_timestep = self._prepare_timestep(
+-            modality.timesteps, self.adaln, batch_size, modality.latent.dtype
++            modality.timesteps, self.adaln, batch_size, modality.latent.dtype,
++            r_timestep=getattr(modality, "r_timesteps", None),
+         )
+         prompt_timestep = None
+         if self.prompt_adaln is not None:
+@@ -300,6 +328,7 @@ class TransformerArgsPreprocessor:
+             enabled=modality.enabled,
+             prompt_timestep=prompt_timestep,
+             self_attention_mask=self_attention_mask,
++            kv_caches=getattr(modality, "kv_caches", None),
+         )
+ 
+ 
+diff --git a/packages/ltx-pipelines/src/ltx_pipelines/ic_lora_cfg.py b/packages/ltx-pipelines/src/ltx_pipelines/ic_lora_cfg.py
+new file mode 100644
+index 0000000..64f0435
+--- /dev/null
++++ b/packages/ltx-pipelines/src/ltx_pipelines/ic_lora_cfg.py
+@@ -0,0 +1,557 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
++import logging
++
++import torch
++
++from ltx_core.allocator_trim_strategy import AllocatorTrimStrategy
++from ltx_core.components.noisers import GaussianNoiser
++from ltx_core.conditioning import ConditioningItem
++from ltx_core.loader import LoraPathStrengthAndSDOps
++from ltx_core.loader.registry import Registry
++from ltx_core.model.transformer.compiling import CompilationConfig
++from ltx_core.model.video_vae import AUTO_TILING, AutoTiling, TilingConfig, VideoEncoder, get_video_chunks_number
++from ltx_core.model.video_vae.transformer import DiffVAEMode
++from ltx_core.quantization import QuantizationPolicy
++from ltx_core.types import VideoPixelShape
++from ltx_pipelines.iclora_utils import (
++    append_ic_lora_reference_video_conditionings,
++    read_lora_reference_downscale_factor,
++    read_lora_reference_temporal_scale_factor,
++)
++from ltx_pipelines.utils.args import (
++    ImageConditioningInput,
++    VideoConditioningAction,
++    VideoMaskConditioningAction,
++    default_2_stage_distilled_arg_parser,
++    resolve_cli_params,
++)
++from ltx_pipelines.utils.blocks import (
++    AudioDecoder,
++    DiffusionStage,
++    ImageConditioner,
++    PromptEncoder,
++    VideoDecoder,
++    VideoUpsampler,
++)
++from ltx_pipelines.utils.constants import (
++    DISTILLED_SIGMAS,
++    STAGE_2_DISTILLED_SIGMAS,
++)
++from ltx_core.components.guiders import MultiModalGuiderParams, create_multimodal_guider_factory
++from ltx_pipelines.utils.denoisers import FactoryGuidedDenoiser, SimpleDenoiser
++
++CFG_NEGATIVE_PROMPT = (
++    "worst quality, blurry, jittery, distorted, warped, watermark, text, "
++    "static image, flickering, deformed limbs, extra limbs"
++)
++CFG_SCALE = float(__import__('os').environ.get('LTX_CFG_SCALE', '4.0'))
++from ltx_pipelines.utils.helpers import (
++    assert_resolution,
++    combined_image_conditionings,
++    ensure_tiling_config,
++    get_device,
++    tiling_scale_factors_for_vae,
++)
++from ltx_pipelines.utils.media_io import (
++    HDRColorSpace,
++    decode_video_by_frame,
++    encode_video,
++    resolve_hdr_color_space,
++    vae_dtype_for_hdr,
++    video_preprocess,
++)
++from ltx_pipelines.utils.model_paths import ModelPaths
++from ltx_pipelines.utils.types import ModalitySpec, OffloadMode, PipelineOutput
++
++
++class ICLoraPipeline:
++    """
++    Two-stage video generation pipeline with In-Context (IC) LoRA support.
++    Allows conditioning the generated video on control signals such as depth maps,
++    human pose, or image edges via the video_conditioning parameter.
++    The specific IC-LoRA model should be provided via the loras parameter.
++    Stage 1 generates video at half of the target resolution, then Stage 2 upsamples
++    by 2x and refines with additional denoising steps for higher quality output.
++    Both stages use distilled models for efficiency.
++    """
++
++    def __init__(  # noqa: PLR0913
++        self,
++        model_paths: ModelPaths,
++        spatial_upsampler_path: str,
++        loras: list[LoraPathStrengthAndSDOps],
++        device: torch.device | None = None,
++        quantization: QuantizationPolicy | None = None,
++        registry: Registry | None = None,
++        compilation_config: CompilationConfig | None = None,
++        offload_mode: OffloadMode = OffloadMode.NONE,
++        alloc_trim_strategy: AllocatorTrimStrategy = AllocatorTrimStrategy.TRIM,
++        prompt_enhancer_gemma_root: str | None = None,
++        diffvae_optimization: DiffVAEMode = DiffVAEMode.CHUNKED_EAGER,
++    ) -> None:
++        self.device = device or get_device()
++        self.dtype = torch.bfloat16
++
++        self.prompt_encoder = PromptEncoder(
++            model_paths,
++            self.dtype,
++            self.device,
++            registry=registry,
++            offload_mode=offload_mode,
++            alloc_trim_strategy=alloc_trim_strategy,
++            prompt_enhancer_gemma_root=prompt_enhancer_gemma_root,
++        )
++        self.image_conditioner = ImageConditioner(
++            model_paths.video_vae(),
++            self.dtype,
++            self.device,
++            registry=registry,
++            alloc_trim_strategy=alloc_trim_strategy,
++        )
++        self.stage_1 = DiffusionStage.from_checkpoint(
++            model_paths.transformer(),
++            self.dtype,
++            self.device,
++            loras=tuple(loras),
++            quantization=quantization,
++            registry=registry,
++            compilation_config=compilation_config,
++            offload_mode=offload_mode,
++            alloc_trim_strategy=alloc_trim_strategy,
++        )
++        self.stage_2 = DiffusionStage.from_checkpoint(
++            model_paths.transformer(),
++            self.dtype,
++            self.device,
++            loras=(),
++            quantization=quantization,
++            registry=registry,
++            compilation_config=compilation_config,
++            offload_mode=offload_mode,
++            alloc_trim_strategy=alloc_trim_strategy,
++        )
++        self.upsampler = VideoUpsampler(
++            model_paths.video_vae(),
++            spatial_upsampler_path,
++            self.dtype,
++            self.device,
++            registry=registry,
++            alloc_trim_strategy=alloc_trim_strategy,
++        )
++        self.video_decoder = VideoDecoder(
++            model_paths.video_vae(),
++            self.dtype,
++            self.device,
++            registry=registry,
++            alloc_trim_strategy=alloc_trim_strategy,
++            diffvae_optimization=diffvae_optimization,
++        )
++        self.audio_decoder = AudioDecoder(
++            model_paths.audio_vae(),
++            self.dtype,
++            self.device,
++            registry=registry,
++            alloc_trim_strategy=alloc_trim_strategy,
++        )
++
++        # Read reference scale factors from LoRA metadata.
++        # IC-LoRAs trained with scaled reference videos store these factors
++        # so inference can resize/subsample reference videos to match training conditions.
++        self.reference_downscale_factor = 1
++        self.reference_temporal_scale_factor = 1
++        for lora in loras:
++            scale = read_lora_reference_downscale_factor(lora.path)
++            if scale != 1:
++                if self.reference_downscale_factor not in (1, scale):
++                    raise ValueError(
++                        f"Conflicting reference_downscale_factor values in LoRAs: "
++                        f"already have {self.reference_downscale_factor}, but {lora.path} "
++                        f"specifies {scale}. Cannot combine LoRAs with different reference scales."
++                    )
++                self.reference_downscale_factor = scale
++            temporal = read_lora_reference_temporal_scale_factor(lora.path)
++            if temporal != 1:
++                if self.reference_temporal_scale_factor not in (1, temporal):
++                    raise ValueError(
++                        f"Conflicting reference_temporal_scale_factor values in LoRAs: "
++                        f"already have {self.reference_temporal_scale_factor}, but {lora.path} "
++                        f"specifies {temporal}. Cannot combine LoRAs with different temporal scales."
++                    )
++                self.reference_temporal_scale_factor = temporal
++
++    def __call__(  # noqa: PLR0913
++        self,
++        prompt: str,
++        seed: int,
++        height: int,
++        width: int,
++        num_frames: int,
++        frame_rate: float,
++        images: list[ImageConditioningInput],
++        video_conditioning: list[tuple[str, float]],
++        enhance_prompt: bool = False,
++        enhance_static_cache: bool = False,
++        vae_dtype: torch.dtype | None = None,
++        tiling_config: TilingConfig | AutoTiling | None = AUTO_TILING,
++        conditioning_attention_strength: float = 1.0,
++        skip_stage_2: bool = False,
++        conditioning_attention_mask: torch.Tensor | None = None,
++        stage_1_sigmas: torch.Tensor = DISTILLED_SIGMAS,
++        stage_2_sigmas: torch.Tensor = STAGE_2_DISTILLED_SIGMAS,
++        color_space: HDRColorSpace | None = None,
++    ) -> PipelineOutput:
++        """
++        Generate video with IC-LoRA conditioning.
++        Args:
++            prompt: Text prompt for video generation.
++            seed: Random seed for reproducibility.
++            height: Output video height in pixels (must be divisible by 64).
++            width: Output video width in pixels (must be divisible by 64).
++            num_frames: Number of frames to generate.
++            frame_rate: Output video frame rate.
++            images: List of (path, frame_idx, strength) tuples for image conditioning.
++            video_conditioning: List of (path, strength) tuples for IC-LoRA video conditioning.
++            enhance_prompt: Whether to enhance the prompt using the text encoder.
++            tiling_config: Optional tiling configuration for VAE decoding.
++            conditioning_attention_strength: Scale factor for IC-LoRA conditioning attention.
++                Controls how strongly the conditioning video influences the output.
++                0.0 = ignore conditioning, 1.0 = full conditioning influence. Default 1.0.
++                When conditioning_attention_mask is provided, the mask is multiplied by
++                this strength before being passed to the conditioning items.
++            skip_stage_2: If True, skip Stage 2 upsampling and refinement. Output will be
++                at half resolution (height//2, width//2). Default is False.
++            conditioning_attention_mask: Optional pixel-space attention mask with the same
++                spatial-temporal dimensions as the input reference video. Shape should be
++                (B, 1, F, H, W) or (1, 1, F, H, W) where F, H, W match the reference
++                video's pixel dimensions. Values in [0, 1].
++                The mask is downsampled to latent space using VAE scale factors (with
++                causal temporal handling for the first frame), then multiplied by
++                conditioning_attention_strength.
++                When None (default): scalar conditioning_attention_strength is used
++                directly.
++        Returns:
++            PipelineOutput with decoded video and audio. ``keyframes`` is ``None``.
++        """
++        images = self.image_conditioner.resolve_crf(images)
++        assert_resolution(height=height, width=width, is_two_stage=True)
++        if not (0.0 <= conditioning_attention_strength <= 1.0):
++            raise ValueError(
++                f"conditioning_attention_strength must be in [0.0, 1.0], got {conditioning_attention_strength}"
++            )
++
++        generator = torch.Generator(device=self.device).manual_seed(seed)
++        noiser = GaussianNoiser(generator=generator)
++        if vae_dtype is None:
++            vae_dtype = self.dtype
++
++        ctx_p, ctx_n = self.prompt_encoder(
++            [prompt, CFG_NEGATIVE_PROMPT],
++            enhance_first_prompt=enhance_prompt,
++            enhance_static_cache=enhance_static_cache,
++            enhance_prompt_image=images[0][0] if len(images) > 0 else None,
++        )
++        video_context, audio_context = ctx_p.video_encoding, ctx_p.audio_encoding
++        v_context_n, a_context_n = ctx_n.video_encoding, ctx_n.audio_encoding
++
++        scale_factors = tiling_scale_factors_for_vae(self.video_decoder.checkpoint_path)
++        tiling_config = ensure_tiling_config(
++            tiling_config,
++            scale_factors=scale_factors,
++            vae_checkpoint_path=self.video_decoder.checkpoint_path,
++            video_shape=VideoPixelShape(batch=1, frames=num_frames, height=height, width=width, fps=frame_rate),
++            diffvae_optimization=self.video_decoder.diffvae_optimization,
++            device=self.device,
++        )
++
++        # Stage 1: Initial low resolution video generation.
++        stage_1_output_shape = VideoPixelShape(
++            batch=1,
++            frames=num_frames,
++            width=width // 2,
++            height=height // 2,
++            fps=frame_rate,
++        )
++
++        # Encode conditionings using the video encoder block
++        stage_1_conditionings = self.image_conditioner(
++            lambda enc: self._create_conditionings(
++                images=images,
++                video_conditioning=video_conditioning,
++                height=stage_1_output_shape.height,
++                width=stage_1_output_shape.width,
++                video_encoder=enc,
++                num_frames=num_frames,
++                conditioning_attention_strength=conditioning_attention_strength,
++                conditioning_attention_mask=conditioning_attention_mask,
++                color_space=color_space,
++            )
++        )
++
++        stage_1_sigmas = stage_1_sigmas.to(dtype=torch.float32, device=self.device)
++
++        video_state, audio_state = self.stage_1(
++            denoiser=FactoryGuidedDenoiser(
++                v_context=video_context,
++                a_context=audio_context,
++                video_guider_factory=create_multimodal_guider_factory(
++                    params=MultiModalGuiderParams(cfg_scale=CFG_SCALE),
++                    negative_context=v_context_n,
++                ),
++                audio_guider_factory=create_multimodal_guider_factory(
++                    params=MultiModalGuiderParams(cfg_scale=1.0),
++                    negative_context=a_context_n,
++                ),
++            ),
++            sigmas=stage_1_sigmas,
++            noiser=noiser,
++            width=stage_1_output_shape.width,
++            height=stage_1_output_shape.height,
++            frames=num_frames,
++            fps=frame_rate,
++            video=ModalitySpec(
++                context=video_context,
++                conditionings=stage_1_conditionings,
++            ),
++            audio=ModalitySpec(
++                context=audio_context,
++            ),
++        )
++
++        if skip_stage_2:
++            # Skip Stage 2: Decode directly from Stage 1 output at half resolution
++            logging.info("[IC-LoRA] Skipping Stage 2 (--skip-stage-2 enabled)")
++            decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
++            decoded_audio = self.audio_decoder(audio_state.latent)
++            return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
++
++        # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
++        upscaled_video_latent = self.upsampler(video_state.latent[:1])
++
++        stage_2_sigmas = stage_2_sigmas.to(dtype=torch.float32, device=self.device)
++        stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
++        stage_2_conditionings = self.image_conditioner(
++            lambda enc: combined_image_conditionings(
++                images=images,
++                height=stage_2_output_shape.height,
++                width=stage_2_output_shape.width,
++                video_encoder=enc,
++                dtype=self.dtype,
++                device=self.device,
++                color_space=color_space,
++            )
++        )
++
++        video_state, audio_state = self.stage_2(
++            denoiser=SimpleDenoiser(video_context, audio_context),
++            sigmas=stage_2_sigmas,
++            noiser=noiser,
++            width=width,
++            height=height,
++            frames=num_frames,
++            fps=frame_rate,
++            video=ModalitySpec(
++                context=video_context,
++                conditionings=stage_2_conditionings,
++                noise_scale=stage_2_sigmas[0].item(),
++                initial_latent=upscaled_video_latent,
++            ),
++            audio=ModalitySpec(
++                context=audio_context,
++                noise_scale=stage_2_sigmas[0].item(),
++                initial_latent=audio_state.latent,
++            ),
++        )
++
++        decoded_video = self.video_decoder(video_state.latent, tiling_config, generator, dtype=vae_dtype)
++        decoded_audio = self.audio_decoder(audio_state.latent)
++        return PipelineOutput(decoded_video, decoded_audio, num_frames, tiling_config, None, video_state.latent)
++
++    def _create_conditionings(
++        self,
++        images: list[ImageConditioningInput],
++        video_conditioning: list[tuple[str, float]],
++        height: int,
++        width: int,
++        num_frames: int,
++        video_encoder: VideoEncoder,
++        conditioning_attention_strength: float = 1.0,
++        conditioning_attention_mask: torch.Tensor | None = None,
++        color_space: HDRColorSpace | None = None,
++    ) -> list[ConditioningItem]:
++        """
++        Create conditioning items for video generation.
++        Args:
++            conditioning_attention_strength: Scalar attention weight in [0, 1].
++                If conditioning_attention_mask is also provided, the downsampled mask
++                is multiplied by this strength. Otherwise this scalar is passed
++                directly as the attention mask.
++            conditioning_attention_mask: Optional pixel-space attention mask with shape
++                (B, 1, F_pixel, H_pixel, W_pixel) matching the reference video's
++                pixel dimensions. Downsampled to latent space with causal temporal
++                handling, then multiplied by conditioning_attention_strength.
++        Returns:
++            List of conditioning items. IC-LoRA conditionings are appended last.
++        """
++        conditionings = combined_image_conditionings(
++            images=images,
++            height=height,
++            width=width,
++            video_encoder=video_encoder,
++            dtype=self.dtype,
++            device=self.device,
++            color_space=color_space,
++        )
++
++        append_ic_lora_reference_video_conditionings(
++            conditionings,
++            video_conditioning,
++            height=height,
++            width=width,
++            num_frames=num_frames,
++            video_encoder=video_encoder,
++            dtype=self.dtype,
++            device=self.device,
++            reference_downscale_factor=self.reference_downscale_factor,
++            reference_temporal_scale_factor=self.reference_temporal_scale_factor,
++            conditioning_attention_strength=conditioning_attention_strength,
++            conditioning_attention_mask=conditioning_attention_mask,
++            tiling_config=None,
++            color_space=color_space,
++        )
++
++        if video_conditioning:
++            logging.info("[IC-LoRA] Added %d video conditioning(s)", len(video_conditioning))
++
++        return conditionings
++
++
++@torch.inference_mode()
++def main() -> None:
++    logging.basicConfig(level=logging.INFO)
++    params = resolve_cli_params(distilled=True)
++    parser = default_2_stage_distilled_arg_parser(params=params)
++    parser.add_argument(
++        "--video-conditioning",
++        action=VideoConditioningAction,
++        nargs=2,
++        metavar=("PATH", "STRENGTH"),
++        required=True,
++        help=(
++            "IC-LoRA reference: video file (SDR) or directory of scene-linear *.exr frames (HDR), "
++            "plus strength. Example: --video-conditioning ref.mp4 1.0  or  --video-conditioning exr_dir/ 1.0"
++        ),
++    )
++    parser.add_argument(
++        "--conditioning-attention-mask",
++        action=VideoMaskConditioningAction,
++        nargs=2,
++        metavar=("MASK_PATH", "STRENGTH"),
++        default=None,
++        help=(
++            "Optional spatial attention mask: path to a grayscale mask video and "
++            "attention strength. The mask video pixel values in [0,1] control "
++            "per-region conditioning attention strength. The strength scalar is "
++            "multiplied with the spatial mask. "
++            "0.0 = ignore IC-LoRA conditioning, 1.0 = full conditioning influence. "
++            "When not provided, full conditioning strength (1.0) is used. "
++            "Example: --conditioning-attention-mask path/to/mask.mp4 0.5"
++        ),
++    )
++    parser.add_argument(
++        "--skip-stage-2",
++        action="store_true",
++        help=(
++            "Skip Stage 2 upsampling and refinement. Output will be at half resolution "
++            "(height//2, width//2). Useful for faster iteration or when GPU memory is limited."
++        ),
++    )
++    args = parser.parse_args()
++
++    # Load mask video if provided via --conditioning-attention-mask
++    conditioning_attention_mask = None
++    conditioning_attention_strength = 1.0
++    if args.conditioning_attention_mask is not None:
++        mask_path, mask_strength = args.conditioning_attention_mask
++        conditioning_attention_strength = mask_strength
++        conditioning_attention_mask = _load_mask_video(
++            mask_path=mask_path,
++            height=args.height // 2,  # Stage 1 operates at half resolution
++            width=args.width // 2,
++            num_frames=args.num_frames,
++        )
++
++    pipeline = ICLoraPipeline(
++        model_paths=args.model_paths,
++        spatial_upsampler_path=args.spatial_upsampler_path,
++        loras=tuple(args.lora) if args.lora else (),
++        quantization=args.quantization,
++        compilation_config=args.compile,
++        offload_mode=args.offload_mode,
++        prompt_enhancer_gemma_root=args.prompt_enhancer_gemma_root,
++        diffvae_optimization=args.diffvae_optimization,
++    )
++    hdr = resolve_hdr_color_space(
++        images=args.images,
++        video_paths=[path for path, _ in args.video_conditioning],
++        hdr=args.hdr,
++    )
++    vae_dtype = vae_dtype_for_hdr(hdr, torch.bfloat16)
++    result = pipeline(
++        prompt=args.prompt,
++        seed=args.seed,
++        height=args.height,
++        width=args.width,
++        num_frames=args.num_frames,
++        frame_rate=args.frame_rate,
++        images=args.images,
++        video_conditioning=args.video_conditioning,
++        enhance_prompt=args.enhance_prompt,
++        enhance_static_cache=args.enhance_static_cache,
++        vae_dtype=vae_dtype,
++        color_space=hdr,
++        tiling_config=AUTO_TILING,
++        conditioning_attention_strength=conditioning_attention_strength,
++        skip_stage_2=args.skip_stage_2,
++        conditioning_attention_mask=conditioning_attention_mask,
++    )
++    encode_video(
++        video=result.video,
++        fps=args.frame_rate,
++        audio=result.audio,
++        output_path=args.output_path,
++        video_chunks_number=get_video_chunks_number(result.num_frames, result.tiling_config),
++        color_space=hdr,
++    )
++
++
++def _load_mask_video(
++    mask_path: str,
++    height: int,
++    width: int,
++    num_frames: int,
++) -> torch.Tensor:
++    """Load a mask video and return a pixel-space tensor of shape (1, 1, F, H, W).
++    The mask video is loaded, resized to (height, width), converted to
++    grayscale, and normalised to [0, 1].
++    Args:
++        mask_path: Path to the mask video file.
++        height: Target height in pixels.
++        width: Target width in pixels.
++        num_frames: Maximum number of frames to load.
++    Returns:
++        Tensor of shape ``(1, 1, F, H, W)`` with values in ``[0, 1]``.
++    """
++    device = get_device()
++    frame_gen = decode_video_by_frame(path=mask_path, frame_cap=num_frames, device=device)
++    mask_video = video_preprocess(frame_gen, height, width, torch.bfloat16, device)
++    # mask_video shape: (1, C, F, H, W) — take mean over channels for grayscale
++    mask = mask_video.mean(dim=1, keepdim=True)  # (1, 1, F, H, W)
++    # Normalise to [0, 1] — video_preprocess applies normalize_latent,
++    # so undo that: values are in [-1, 1], remap to [0, 1]
++    mask = (mask + 1.0) / 2.0
++    return mask.clamp(0.0, 1.0)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/packages/ltx-trainer/scripts/process_dataset_nocap.py b/packages/ltx-trainer/scripts/process_dataset_nocap.py
+new file mode 100755
+index 0000000..5a58af5
+--- /dev/null
++++ b/packages/ltx-trainer/scripts/process_dataset_nocap.py
+@@ -0,0 +1,472 @@
++#!/usr/bin/env python3
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
++
++"""
++Preprocess a media dataset for LTX-2 training.
++Automatically detects dataset columns and processes each according to a convention table.
++Column names determine what gets encoded and where outputs go — no per-role CLI flags needed.
++Convention table:
++    video           → Video VAE    → latents/
++    audio           → Audio VAE    → audio_latents/
++    reference_video → Video VAE    → reference_latents/
++    reference_audio → Audio VAE    → reference_audio_latents/
++    video_mask      → (downsample) → video_masks/
++    audio_mask      → (downsample) → audio_masks/
++    caption         → Text encoder → conditions/
++Legacy aliases: media_path → video, ref_media_path → reference_video
++Basic usage:
++    python scripts/process_dataset.py /path/to/dataset.json --resolution-buckets 768x768x49 \\
++        --model-path /path/to/ltx-checkpoint.safetensors --text-encoder-path /path/to/gemma-root
++"""
++
++from pathlib import Path
++
++import typer
++from decode_latents import LatentsDecoder
++from process_captions import compute_captions_embeddings
++from process_videos import (
++    compute_audio_latents,
++    compute_audio_masks,
++    compute_latents,
++    compute_scaled_resolution_buckets,
++    compute_video_masks,
++    detect_dataset_columns,
++    parse_resolution_buckets,
++)
++from rich.console import Console
++
++from ltx_trainer import logger
++from ltx_trainer.gpu_utils import free_gpu_memory_context
++from ltx_trainer.model_loader import read_video_scale_factors, resolve_video_vae_path
++
++console = Console()
++
++app = typer.Typer(
++    pretty_exceptions_enable=False,
++    no_args_is_help=True,
++    help="Preprocess a media dataset for LTX family training. "
++    "Automatically detects columns (video, audio, reference_video, reference_audio, caption) "
++    "and processes each with the appropriate encoder.",
++)
++
++_KNOWN_ROLES = {"video", "audio", "reference_video", "reference_audio", "video_mask", "audio_mask", "caption"}
++_LEGACY_ALIASES = {"media_path": "video", "ref_media_path": "reference_video"}
++
++
++def preprocess_dataset(  # noqa: PLR0912, PLR0913, PLR0915
++    dataset_file: str,
++    resolution_buckets: list[tuple[int, int, int]] | None,
++    model_path: str,
++    text_encoder_path: str,
++    device: str,
++    video_vae_path: str | None = None,
++    audio_vae_path: str | None = None,
++    output_dir: str | None = None,
++    video_column: str | None = None,
++    caption_column: str | None = None,
++    batch_size: int = 1,
++    lora_trigger: str | None = None,
++    vae_tiling: bool = False,
++    decode: bool = False,
++    remove_llm_prefixes: bool = False,
++    reference_downscale_factor: int = 1,
++    reference_temporal_scale_factor: int = 1,
++    skip_audio: bool = False,
++    audio_durations: list[float] | None = None,
++    load_text_encoder_in_8bit: bool = False,
++    overwrite: bool = False,
++) -> None:
++    """Run the preprocessing pipeline with convention-based column detection."""
++    _validate_dataset_file(dataset_file)
++
++    # Video VAE compression factors, derived from the checkpoint config (default 32x32x8).
++    # audio_vae_path stays unresolved and is passed through as-is: the phases below resolve it
++    # only when they actually encode audio, so a video-only run needs no audio VAE.
++    video_vae_path = resolve_video_vae_path(model_path, video_vae_path)
++    scale_factors = read_video_scale_factors(video_vae_path)
++
++    # Detect columns and resolve roles
++    dataset_columns = detect_dataset_columns(dataset_file)
++    roles = _resolve_columns(dataset_columns, video_column, caption_column)
++
++    # Log detected roles
++    for role, col in sorted(roles.items()):
++        alias_note = f" (alias for '{role}')" if col != role else ""
++        logger.info(f"Detected column '{col}'{alias_note} → {role}")
++
++    # Validate: need at least caption
++    if "caption" not in roles and False:                                        # nocap variant: texts are encoded once elsewhere
++        raise ValueError(
++            f"No caption column found. Dataset has columns: {dataset_columns}. "
++            f"Expected 'caption' or use --caption-column to specify."
++        )
++
++    # Validate: need video or audio
++    has_video = "video" in roles
++    has_audio = "audio" in roles
++    if not has_video and not has_audio:
++        raise ValueError(
++            f"No media column found. Dataset has columns: {dataset_columns}. "
++            f"Expected 'video', 'audio', or 'media_path' (legacy)."
++        )
++
++    # Validate: video modes need resolution buckets
++    if has_video and not resolution_buckets:
++        raise ValueError("--resolution-buckets is required when the dataset has a video column.")
++
++    output_base = Path(output_dir) if output_dir else Path(dataset_file).parent / ".precomputed"
++
++    if lora_trigger:
++        logger.info(f'LoRA trigger word "{lora_trigger}" will be prepended to all captions')
++
++    # --- Phase 1: Text encoder ---
++    with (free_gpu_memory_context() if "caption" in roles else __import__("contextlib").nullcontext()):
++      if "caption" in roles:
++        compute_captions_embeddings(
++            dataset_file=dataset_file,
++            output_dir=str(output_base / "conditions"),
++            model_path=model_path,
++            text_encoder_path=text_encoder_path,
++            caption_column=roles["caption"],
++            media_column=roles.get("video") or roles.get("audio") or roles["caption"],
++            lora_trigger=lora_trigger,
++            remove_llm_prefixes=remove_llm_prefixes,
++            batch_size=batch_size,
++            device=device,
++            load_in_8bit=load_text_encoder_in_8bit,
++            overwrite=overwrite,
++        )
++
++    # --- Phase 2: Video VAE (video, reference_video) ---
++    if has_video and resolution_buckets:
++        # Determine if audio should be auto-extracted from video files
++        auto_audio = not skip_audio and "audio" not in roles
++
++        audio_latents_dir = str(output_base / "audio_latents") if auto_audio else None
++        if auto_audio:
++            logger.info("Audio will be auto-extracted from video files (use --skip-audio to disable)")
++
++        with free_gpu_memory_context():
++            compute_latents(
++                dataset_file=dataset_file,
++                video_column=roles["video"],
++                resolution_buckets=resolution_buckets,
++                output_dir=str(output_base / "latents"),
++                model_path=model_path,
++                video_vae_path=video_vae_path,
++                audio_vae_path=audio_vae_path,
++                batch_size=batch_size,
++                device=device,
++                vae_tiling=vae_tiling,
++                with_audio=auto_audio,
++                audio_output_dir=audio_latents_dir,
++                overwrite=overwrite,
++            )
++
++        # Process reference video if present
++        if "reference_video" in roles:
++            if reference_downscale_factor > 1 and len(resolution_buckets) > 1:
++                raise ValueError(
++                    "When using --reference-downscale-factor > 1, only a single resolution bucket is supported."
++                )
++            if reference_temporal_scale_factor > 1 and len(resolution_buckets) > 1:
++                raise ValueError(
++                    "When using --reference-temporal-scale-factor > 1, only a single resolution bucket is supported."
++                )
++
++            reference_buckets = compute_scaled_resolution_buckets(
++                resolution_buckets, reference_downscale_factor, scale_factors
++            )
++            if reference_downscale_factor > 1:
++                logger.info(f"Processing reference videos at 1/{reference_downscale_factor} resolution...")
++            if reference_temporal_scale_factor > 1:
++                logger.info(
++                    f"Temporally subsampling reference videos by {reference_temporal_scale_factor}x "
++                    f"(VAE-aligned pattern)..."
++                )
++
++            with free_gpu_memory_context():
++                compute_latents(
++                    dataset_file=dataset_file,
++                    main_media_column=roles["video"],
++                    video_column=roles["reference_video"],
++                    resolution_buckets=reference_buckets,
++                    output_dir=str(output_base / "reference_latents"),
++                    model_path=model_path,
++                    video_vae_path=video_vae_path,
++                    audio_vae_path=audio_vae_path,
++                    batch_size=batch_size,
++                    device=device,
++                    vae_tiling=vae_tiling,
++                    overwrite=overwrite,
++                    temporal_subsample_factor=reference_temporal_scale_factor,
++                )
++
++    # --- Phase 2b: Masks (video_mask, audio_mask) — processed after video latents for alignment ---
++    if "video_mask" in roles and has_video:
++        compute_video_masks(
++            dataset_file=dataset_file,
++            mask_column=roles["video_mask"],
++            latents_dir=str(output_base / "latents"),
++            output_dir=str(output_base / "video_masks"),
++            main_media_column=roles["video"],
++            scale_factors=scale_factors,
++        )
++
++    # --- Phase 3: Audio VAE (audio, reference_audio) ---
++    audio_roles_to_process = [
++        ("audio", "audio_latents"),
++        ("reference_audio", "reference_audio_latents"),
++    ]
++    active_audio_roles = [(role, subdir) for role, subdir in audio_roles_to_process if role in roles]
++
++    if active_audio_roles:
++        # Determine audio duration constraint: video bucket → max_duration, or explicit buckets
++        max_audio_duration = None
++        audio_duration_buckets = None
++        if has_video and resolution_buckets:
++            max_audio_duration = max(f for f, _h, _w in resolution_buckets) / 25.0
++        elif audio_durations:
++            audio_duration_buckets = audio_durations
++
++        for role, output_subdir in active_audio_roles:
++            with free_gpu_memory_context():
++                compute_audio_latents(
++                    dataset_file=dataset_file,
++                    audio_column=roles[role],
++                    output_dir=str(output_base / output_subdir),
++                    model_path=model_path,
++                    audio_vae_path=audio_vae_path,
++                    main_media_column=roles.get("video"),
++                    max_duration=max_audio_duration,
++                    duration_buckets=audio_duration_buckets,
++                    device=device,
++                    overwrite=overwrite,
++                )
++
++    # --- Phase 4: Audio masks (after audio latents exist for temporal alignment) ---
++    if "audio_mask" in roles:
++        audio_latents_source = output_base / "audio_latents"
++        if audio_latents_source.exists():
++            compute_audio_masks(
++                dataset_file=dataset_file,
++                mask_column=roles["audio_mask"],
++                audio_latents_dir=str(audio_latents_source),
++                output_dir=str(output_base / "audio_masks"),
++                main_media_column=roles.get("video") or roles.get("audio"),
++            )
++        else:
++            logger.warning("audio_mask column found but no audio_latents/ — run with audio first")
++
++    # --- Decode for verification ---
++    if decode:
++        logger.info("Decoding latents for verification...")
++        decoder = LatentsDecoder(
++            model_path=model_path,
++            video_vae_path=video_vae_path,
++            audio_vae_path=audio_vae_path,
++            device=device,
++            vae_tiling=vae_tiling,
++            with_audio=has_audio,
++        )
++        if has_video:
++            decoder.decode(output_base / "latents", output_base / "decoded_videos")
++        if "reference_video" in roles and (output_base / "reference_latents").exists():
++            decoder.decode(output_base / "reference_latents", output_base / "decoded_reference_videos")
++
++    # --- Summary ---
++    logger.info(f"Dataset preprocessing complete! Results saved to {output_base}")
++    produced = [d.name for d in output_base.iterdir() if d.is_dir() and not d.name.startswith("decoded")]
++    logger.info(f"Output directories: {', '.join(sorted(produced))}")
++
++
++def _validate_dataset_file(dataset_path: str) -> None:
++    """Validate that the dataset file exists and has the correct format."""
++    dataset_file = Path(dataset_path)
++    if not dataset_file.exists():
++        raise FileNotFoundError(f"Dataset file does not exist: {dataset_file}")
++    if not dataset_file.is_file():
++        raise ValueError(f"Dataset path must be a file, not a directory: {dataset_file}")
++    if dataset_file.suffix.lower() not in [".csv", ".json", ".jsonl"]:
++        raise ValueError(f"Dataset file must be CSV, JSON, or JSONL format: {dataset_file}")
++
++
++def _resolve_columns(
++    dataset_columns: set[str],
++    video_column_override: str | None = None,
++    caption_column_override: str | None = None,
++) -> dict[str, str]:
++    """Map canonical role names to actual dataset column names.
++    Returns a dict of role → column_name for recognized roles found in the dataset.
++    """
++    roles: dict[str, str] = {}
++    for col in dataset_columns:
++        role = _LEGACY_ALIASES.get(col, col)
++        if role in _KNOWN_ROLES:
++            roles[role] = col
++
++    if video_column_override and video_column_override in dataset_columns:
++        roles["video"] = video_column_override
++    if caption_column_override and caption_column_override in dataset_columns:
++        roles["caption"] = caption_column_override
++
++    return roles
++
++
++@app.command()
++def main(  # noqa: PLR0913
++    dataset_path: str = typer.Argument(
++        ...,
++        help="Path to metadata file (CSV/JSON/JSONL) with columns matching the convention table",
++    ),
++    resolution_buckets: str | None = typer.Option(
++        default=None,
++        help='Resolution buckets in format "WxHxF;WxHxF;..." (e.g. "768x768x25"). '
++        "Required when dataset has a video column.",
++    ),
++    model_path: str = typer.Option(
++        ...,
++        help="Path to the unified checkpoint or split transformer safetensors",
++    ),
++    text_encoder_path: str = typer.Option(
++        ...,
++        help="Path to the matching Gemma directory or packed text-encoder safetensors",
++    ),
++    video_vae_path: str | None = typer.Option(
++        default=None,
++        help="Split-pack video VAE safetensors (defaults to --model-path for unified checkpoints)",
++    ),
++    audio_vae_path: str | None = typer.Option(
++        default=None,
++        help="Split-pack audio VAE safetensors (defaults to --model-path for unified checkpoints)",
++    ),
++    caption_column: str | None = typer.Option(
++        default=None,
++        help="Override: treat this column as 'caption' (default: auto-detect 'caption')",
++    ),
++    video_column: str | None = typer.Option(
++        default=None,
++        help="Override: treat this column as 'video' (default: auto-detect 'video' or 'media_path')",
++    ),
++    batch_size: int = typer.Option(
++        default=1,
++        help="Batch size for preprocessing",
++    ),
++    device: str = typer.Option(
++        default="cuda",
++        help="Device to use for computation",
++    ),
++    vae_tiling: bool = typer.Option(
++        default=False,
++        help="Enable VAE tiling for larger video resolutions",
++    ),
++    output_dir: str | None = typer.Option(
++        default=None,
++        help="Output directory (defaults to .precomputed in dataset directory)",
++    ),
++    lora_trigger: str | None = typer.Option(
++        default=None,
++        help="Optional trigger word to prepend to each caption",
++    ),
++    decode: bool = typer.Option(
++        default=False,
++        help="Decode and save latents after encoding for verification",
++    ),
++    remove_llm_prefixes: bool = typer.Option(
++        default=False,
++        help="Remove LLM prefixes from captions",
++    ),
++    skip_audio: bool = typer.Option(
++        default=False,
++        help="Don't extract audio from video files (audio extraction is on by default)",
++    ),
++    audio_durations: str | None = typer.Option(
++        default=None,
++        help='Audio duration buckets in seconds for audio-only datasets (e.g. "2.0;4.0;8.0"). '
++        "When set, audio files are trimmed to the best matching duration. "
++        "Not needed when a video column is present (audio duration derived from video bucket).",
++    ),
++    with_audio: bool = typer.Option(
++        default=False,
++        hidden=True,
++        help="[DEPRECATED: audio is now on by default, use --skip-audio to disable]",
++    ),
++    load_text_encoder_in_8bit: bool = typer.Option(
++        default=False,
++        help="Load the Gemma text encoder in 8-bit precision to save GPU memory",
++    ),
++    reference_downscale_factor: int = typer.Option(
++        default=1,
++        help="Downscale factor for reference video resolution (e.g., 2 = half resolution for IC-LoRA)",
++    ),
++    reference_temporal_scale_factor: int = typer.Option(
++        default=1,
++        help="Temporal subsampling factor for reference videos (e.g., 2 = half frame rate, "
++        "VAE-aligned: keeps frame 0, then every Nth frame from frame 1 onwards)",
++    ),
++    overwrite: bool = typer.Option(
++        default=False,
++        help="Re-compute every item even if its output exists. Use when rerunning with "
++        "changed parameters (different model, resolution, etc.) so stale outputs are replaced.",
++    ),
++) -> None:
++    """Preprocess a media dataset for LTX family training.
++    See module docstring for the convention table. Audio is auto-extracted from
++    video files by default — use --skip-audio to disable.
++    Checkpoint architecture and VAE factors are detected automatically. When switching
++    checkpoint or Gemma versions, use a fresh output directory or --overwrite.
++    For multi-GPU preprocessing, invoke under ``accelerate launch`` -- each process
++    will handle an interleaved shard of the dataset.
++    """
++    # Handle deprecated --with-audio flag
++    if with_audio:
++        logger.warning(
++            "--with-audio is deprecated. Audio extraction is now on by default. Use --skip-audio to disable."
++        )
++
++    scale_factors = read_video_scale_factors(resolve_video_vae_path(model_path, video_vae_path))
++    parsed_buckets = parse_resolution_buckets(resolution_buckets, scale_factors) if resolution_buckets else None
++
++    if parsed_buckets and len(parsed_buckets) > 1:
++        logger.warning("Using multiple resolution buckets. Training batch size must be 1.")
++
++    if reference_downscale_factor < 1:
++        raise typer.BadParameter("--reference-downscale-factor must be >= 1")
++
++    if reference_temporal_scale_factor < 1:
++        raise typer.BadParameter("--reference-temporal-scale-factor must be >= 1")
++
++    parsed_audio_durations = None
++    if audio_durations:
++        parsed_audio_durations = [float(d) for d in audio_durations.split(";")]
++        if any(d <= 0 for d in parsed_audio_durations):
++            raise typer.BadParameter("All audio durations must be positive")
++
++    preprocess_dataset(
++        dataset_file=dataset_path,
++        resolution_buckets=parsed_buckets,
++        model_path=model_path,
++        text_encoder_path=text_encoder_path,
++        device=device,
++        video_vae_path=video_vae_path,
++        audio_vae_path=audio_vae_path,
++        output_dir=output_dir,
++        video_column=video_column,
++        caption_column=caption_column,
++        batch_size=batch_size,
++        lora_trigger=lora_trigger,
++        vae_tiling=vae_tiling,
++        decode=decode,
++        remove_llm_prefixes=remove_llm_prefixes,
++        reference_downscale_factor=reference_downscale_factor,
++        reference_temporal_scale_factor=reference_temporal_scale_factor,
++        skip_audio=skip_audio,
++        audio_durations=parsed_audio_durations,
++        load_text_encoder_in_8bit=load_text_encoder_in_8bit,
++        overwrite=overwrite,
++    )
++
++
++if __name__ == "__main__":
++    app()
+diff --git a/packages/ltx-trainer/src/ltx_trainer/causal_mask.py b/packages/ltx-trainer/src/ltx_trainer/causal_mask.py
+new file mode 100644
+index 0000000..d949fae
+--- /dev/null
++++ b/packages/ltx-trainer/src/ltx_trainer/causal_mask.py
+@@ -0,0 +1,233 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
++"""Block-causal self-attention masks for chunk-wise LTX rollout.
++
++Why a mask at all
++-----------------
++Without one the window is fully bidirectional, so a token's K/V depend on every
++other token in the window -- including the noisy ones still being denoised. That
++makes them change at every denoising step and every rollout round, which is why
++the settled past cannot be cached and each chunk costs a full-window recompute.
++
++Under block-causal attention a block only attends to blocks at or before it, so
++once a block is clean its K/V are final. That is the property a KV cache needs.
++
++Sequence layout (see FlexibleTrainingStrategy._apply_reference_condition)
++------------------------------------------------------------------------
++Reference latents are concatenated *before* the target::
++
++    [ reference: F frames ][ target: F frames ]
++      tokens_per_frame each, so T = 2 * F * tokens_per_frame
++
++`reference_mode` decides what the reference half may be attended to:
++
++``"aligned"`` (default)
++    Reference frame *f* sits in the same causal block as target frame *f*, so a
++    target block sees reference frames up to its own and no further. This is the
++    honest deployment geometry: at chunk *k* the engine has rendered white-box
++    frames through chunk *k* and no more. Letting training peek at later
++    white-box frames would train a dependency inference cannot supply.
++
++``"global"``
++    Every target block sees the whole reference half (OmniForcing's "Global
++    Prefix"). Only correct when the entire control signal really is available up
++    front -- e.g. rendering a fixed UE take offline rather than driving a live
++    engine.
++
++Blocks are assigned by latent frame index, uniformly across both halves::
++
++    frame 0 .. first_block_frames-1          -> block 0
++    then every `block_size` frames           -> block 1, 2, ...
++
++`first_block_frames` exists because the video VAE is causal: its first latent
++frame covers a single pixel frame while the rest cover eight, so the first block
++usually wants one extra frame to line up with a round number of pixel frames.
++Setting `block_size >= num_frames` reproduces full bidirectional attention,
++which makes "no mask" a special case of this function rather than a separate
++code path.
++"""
++
++from __future__ import annotations
++
++import torch
++
++__all__ = ["assign_blocks", "build_block_causal_mask", "build_clean_copy_tf_mask"]
++
++
++def assign_blocks(
++    num_frames: int,
++    block_size: int,
++    first_block_frames: int | None = None,
++) -> list[int]:
++    """Map each latent frame index to its causal block index.
++
++    Returns a list of length ``num_frames``; entry *f* is the block owning frame
++    *f*. Block indices are consecutive from 0.
++    """
++    if num_frames < 1:
++        raise ValueError(f"num_frames must be >= 1, got {num_frames}")
++    if block_size < 1:
++        raise ValueError(f"block_size must be >= 1, got {block_size}")
++    first = block_size if first_block_frames is None else first_block_frames
++    if first < 1:
++        raise ValueError(f"first_block_frames must be >= 1, got {first}")
++
++    blocks: list[int] = []
++    frame = 0
++    block_idx = 0
++    while frame < num_frames:
++        span = first if block_idx == 0 else block_size
++        for _ in range(min(span, num_frames - frame)):
++            blocks.append(block_idx)
++        frame += span
++        block_idx += 1
++    return blocks
++
++
++def build_block_causal_mask(
++    num_frames: int,
++    tokens_per_frame: int,
++    block_size: int,
++    *,
++    has_reference: bool = True,
++    reference_first: bool = True,
++    reference_mode: str = "aligned",
++    first_block_frames: int | None = None,
++    batch_size: int = 1,
++    device: torch.device | str = "cpu",
++    dtype: torch.dtype = torch.float32,
++) -> torch.Tensor:
++    """Build a ``(batch_size, T, T)`` mask in the [0, 1] convention Modality wants.
++
++    1.0 means the query may attend to the key, 0.0 means it may not.
++    ``Modality.attention_mask`` takes exactly this; the transformer converts it
++    to an additive log-space bias itself.
++
++    Args:
++        num_frames: latent frames in the *target* half.
++        tokens_per_frame: tokens per latent frame, ``(H // 32) * (W // 32)`` for
++            LTX at patch_size 1.
++        block_size: latent frames per causal block. ``1`` is frame-wise;
++            ``>= num_frames`` degenerates to full bidirectional attention.
++        has_reference: whether reference latents are concatenated with the target.
++        reference_first: layout of the concatenation. The trainer prepends the
++            reference (``[reference][target]``, see
++            ``FlexibleStrategy._apply_reference_condition``) while the validation
++            runner appends it (``[target][reference]``). RoPE positions make the
++            model indifferent to the order, but the mask must know where each
++            half lives.
++        reference_mode: ``"aligned"`` or ``"global"`` -- see the module docstring.
++        first_block_frames: frames in block 0 (defaults to ``block_size``).
++    """
++    if reference_mode not in ("aligned", "global"):
++        raise ValueError(f"reference_mode must be 'aligned' or 'global', got {reference_mode!r}")
++    if tokens_per_frame < 1:
++        raise ValueError(f"tokens_per_frame must be >= 1, got {tokens_per_frame}")
++
++    frame_blocks = assign_blocks(num_frames, block_size, first_block_frames)
++
++    # Per-token block id for the whole sequence. The reference half repeats the
++    # target's block assignment so frame f lines up with frame f across halves.
++    per_frame = torch.tensor(frame_blocks, dtype=torch.long, device=device)
++    target_token_blocks = per_frame.repeat_interleave(tokens_per_frame)
++
++    half = num_frames * tokens_per_frame
++    if has_reference:
++        # Both halves share the per-frame block assignment so frame f lines up
++        # with frame f across halves regardless of which half comes first.
++        token_blocks = torch.cat([target_token_blocks, target_token_blocks])
++        if reference_first:
++            ref_slice, tgt_slice = slice(0, half), slice(half, 2 * half)
++        else:
++            ref_slice, tgt_slice = slice(half, 2 * half), slice(0, half)
++    else:
++        token_blocks = target_token_blocks
++
++    # Block-causal: query in block q attends to keys in blocks <= q.
++    allowed = token_blocks.unsqueeze(1) >= token_blocks.unsqueeze(0)  # (T, T)
++
++    if has_reference:
++        # The reference half never attends to the target half. Two reasons, and
++        # either alone would justify it: the white-box is an input, so letting
++        # the generation feed back into it is meaningless; and if reference
++        # tokens attended to noisy target tokens their K/V would change at every
++        # denoising step, which is exactly the property a KV cache needs them
++        # not to have. Reference tokens stay block-causal among themselves so a
++        # sliding window does not rewrite the K/V of white-box frames it has
++        # already seen.
++        allowed[ref_slice, tgt_slice] = False
++
++        if reference_mode == "global":
++            # Every target query sees the whole reference half. Deliberately
++            # scoped to target rows so the rule above still holds.
++            allowed[tgt_slice, ref_slice] = True
++
++    mask = allowed.to(dtype).unsqueeze(0)
++    if batch_size != 1:
++        mask = mask.expand(batch_size, -1, -1)
++    return mask
++
++
++def build_clean_copy_tf_mask(
++    num_frames: int,
++    tokens_per_frame: int,
++    block_size: int,
++    *,
++    has_reference: bool = True,
++    reference_mode: str = "aligned",
++    first_block_frames: int | None = None,
++    batch_size: int = 1,
++    device: torch.device | str = "cpu",
++    dtype: torch.dtype = torch.float32,
++) -> torch.Tensor:
++    """Teacher-forcing mask with a clean copy of the target (Causal Forcing / Causal-rCM layout).
++
++    Training-only layout, ``[reference F][clean F][noisy F]`` (or ``[clean F][noisy F]``):
++
++        noisy block q  ->  noisy block == q          (its own tokens only; noisy blocks never see each other)
++                       ->  clean blocks  <  q        (the honest history: what the KV cache holds at inference)
++                       ->  reference blocks <= q     (aligned; "global" exposes the whole reference)
++        clean block q  ->  clean blocks <= q, reference blocks <= q   (exactly the commit pass at inference)
++        reference      ->  reference blocks <= q only
++
++    Every noisy block therefore trains "generate one block given an all-clean history", which is the
++    geometry streaming inference produces, and the loss covers every history length in one sample.
++    Nothing ever attends to a noisy block other than itself, so clean/reference K/V are cacheable.
++    """
++    if reference_mode not in ("aligned", "global"):
++        raise ValueError(f"reference_mode must be 'aligned' or 'global', got {reference_mode!r}")
++    if tokens_per_frame < 1:
++        raise ValueError(f"tokens_per_frame must be >= 1, got {tokens_per_frame}")
++
++    per_frame = torch.tensor(assign_blocks(num_frames, block_size, first_block_frames), dtype=torch.long, device=device)
++    blk = per_frame.repeat_interleave(tokens_per_frame)  # (half,)
++    half = num_frames * tokens_per_frame
++
++    segments = ["ref", "clean", "noisy"] if has_reference else ["clean", "noisy"]
++    offsets = {name: i * half for i, name in enumerate(segments)}
++    total = len(segments) * half
++    allowed = torch.zeros(total, total, dtype=torch.bool, device=device)
++
++    q_blk = blk.unsqueeze(1)  # (half, 1)
++    k_blk = blk.unsqueeze(0)  # (1, half)
++    le = q_blk >= k_blk
++    lt = q_blk > k_blk
++    eq = q_blk == k_blk
++
++    def put(q: str, k: str, rule: torch.Tensor) -> None:
++        qs, ks = offsets[q], offsets[k]
++        allowed[qs : qs + half, ks : ks + half] = rule
++
++    put("noisy", "noisy", eq)
++    put("noisy", "clean", lt)
++    put("clean", "clean", le)
++    if has_reference:
++        ref_rule = torch.ones_like(le) if reference_mode == "global" else le
++        put("noisy", "ref", ref_rule)
++        put("clean", "ref", ref_rule)
++        put("ref", "ref", le)
++
++    mask = allowed.to(dtype).unsqueeze(0)
++    if batch_size != 1:
++        mask = mask.expand(batch_size, -1, -1)
++    return mask
+diff --git a/packages/ltx-trainer/src/ltx_trainer/config.py b/packages/ltx-trainer/src/ltx_trainer/config.py
+index dfb9ba0..3255e13 100644
+--- a/packages/ltx-trainer/src/ltx_trainer/config.py
++++ b/packages/ltx-trainer/src/ltx_trainer/config.py
+@@ -1,3 +1,5 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
+ from pathlib import Path
+ from typing import Annotated, Literal, Union
+ 
+@@ -250,6 +252,13 @@ class ModelConfig(ConfigBaseModel):
+         description="Training mode - either LoRA fine-tuning or full model fine-tuning",
+     )
+ 
++    frozen_param_patterns: list[str] | None = Field(
++        default=None,
++        description="Substrings matched against parameter names; matching parameters are frozen "
++        "during a full fine-tune. Use it to skip branches that carry no gradient signal for the "
++        "task, e.g. ['audio'] when the run never generates audio.",
++    )
++
+     load_checkpoint: str | Path | None = Field(
+         default=None,
+         description="Path to a checkpoint file or directory to load from. "
+@@ -493,6 +502,22 @@ class ValidationConfig(ConfigBaseModel):
+         default=42,
+         description="Random seed used when sampling validation videos",
+     )
++    causal_block_size: int | None = Field(
++        default=None,
++        description=(
++            "Apply the same block-causal self-attention mask used in training during validation "
++            "(frames per block; 1 = frame-wise). None = bidirectional. Must match the training strategy's "
++            "causal_block_size, otherwise validation measures a different model than the one being trained."
++        ),
++    )
++    causal_first_block_frames: int | None = Field(
++        default=None,
++        description="Frames in causal block 0; defaults to causal_block_size.",
++    )
++    causal_reference_mode: Literal["aligned", "global"] = Field(
++        default="aligned",
++        description="Reference visibility under the causal mask; see FlexibleStrategy ModalityConfig.",
++    )
+ 
+     inference_steps: int = Field(
+         default=30,
+diff --git a/packages/ltx-trainer/src/ltx_trainer/trainer.py b/packages/ltx-trainer/src/ltx_trainer/trainer.py
+index 372d060..815d499 100644
+--- a/packages/ltx-trainer/src/ltx_trainer/trainer.py
++++ b/packages/ltx-trainer/src/ltx_trainer/trainer.py
+@@ -1,3 +1,5 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
+ import contextlib
+ import math
+ import os
+@@ -447,6 +449,10 @@ class LtxvTrainer:
+             )
+ 
+         self._transformer.requires_grad_(False)
++        vcfg = getattr(self._config.training_strategy, "video", None)
++        if vcfg is not None and getattr(vcfg, "slot_embedding", False):
++            self._transformer.enable_slot_embedding(3)                                 # slots 1 player, 2 boss A, 3 boss B (zero-init)
++            logger.info("slot embedding enabled (3 slots, zero-init, trained with the LoRA)")
+ 
+     def _collect_trainable_params(self) -> None:
+         """Collect trainable parameters based on training mode."""
+@@ -456,9 +462,19 @@ class LtxvTrainer:
+         elif self._config.model.training_mode == "full":
+             # For full training, unfreeze all transformer parameters
+             self._transformer.requires_grad_(True)
++            patterns = self._config.model.frozen_param_patterns or []
++            if patterns:
++                frozen = 0
++                for name, param in self._transformer.named_parameters():
++                    if any(p in name for p in patterns):
++                        param.requires_grad_(False)
++                        frozen += param.numel()
++                logger.info(f"Froze {frozen:,} parameters matching {patterns}")
+         else:
+             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
+ 
++        for name, param in self._transformer.named_parameters():
++            if "slot_embedding" in name: param.requires_grad_(True)
+         self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
+         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+ 
+@@ -637,6 +653,8 @@ class LtxvTrainer:
+ 
+         # noinspection PyTypeChecker
+         self._transformer = self._accelerator.prepare(self._transformer)
++        if hasattr(self._training_strategy, "model"):
++            self._training_strategy.model = self._transformer   # Resampling Forcing needs no-grad model calls
+ 
+         # Log GPU memory usage after model preparation
+         vram_usage_gb = torch.cuda.memory_allocated() / 1024**3
+@@ -959,7 +977,9 @@ class LtxvTrainer:
+         if is_lora:
+             unwrapped = self._accelerator.unwrap_model(self._transformer, keep_torch_compile=False)
+             # For FSDP, pass the gathered state dict since model params aren't directly accessible
++            full_sd = state_dict if is_fsdp else {k: v for k, v in unwrapped.named_parameters() if "slot_embedding" in k}
+             state_dict = get_peft_model_state_dict(unwrapped, state_dict=state_dict if is_fsdp else None)
++            state_dict.update({k: v for k, v in full_sd.items() if "slot_embedding" in k})   # the binding table rides with the LoRA
+ 
+             # Remove "base_model.model." prefix added by PEFT
+             state_dict = {k.replace("base_model.model.", "", 1): v for k, v in state_dict.items()}
+diff --git a/packages/ltx-trainer/src/ltx_trainer/training_strategies/flexible.py b/packages/ltx-trainer/src/ltx_trainer/training_strategies/flexible.py
+index 0afd6e0..347f215 100644
+--- a/packages/ltx-trainer/src/ltx_trainer/training_strategies/flexible.py
++++ b/packages/ltx-trainer/src/ltx_trainer/training_strategies/flexible.py
+@@ -1,3 +1,5 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
+ """Flexible training strategy for a unified conditioning framework.
+ This strategy implements the Unified Conditioning Framework that supports:
+ - Simple fine-tuning with text conditioning (text-to-video/audio)
+@@ -9,13 +11,19 @@ all conditioning scenarios through configuration rather than code.
+ 
+ from dataclasses import dataclass
+ from pathlib import Path
++import random
+ from typing import Annotated, Any, Literal, Union
+ 
+ import torch
+ from pydantic import BaseModel, ConfigDict, Field, model_validator
+ from torch import Tensor
+ 
++import logging
++
+ from ltx_core.model.transformer.modality import Modality
++from ltx_trainer.causal_mask import build_block_causal_mask, build_clean_copy_tf_mask
++
++logger = logging.getLogger(__name__)
+ from ltx_core.types import SpatioTemporalScaleFactors
+ from ltx_trainer.timestep_samplers import TimestepSampler
+ from ltx_trainer.training_strategies.base_strategy import (
+@@ -53,12 +61,53 @@ class PrefixConditionConfig(IntrinsicConditionBase):
+     """Prefix conditioning — first N temporal units are clean, excluded from loss."""
+ 
+     type: Literal["prefix"] = "prefix"
++    temporal_boundary_choices: list[int] | None = Field(
++        default=None,
++        description="When set, each step samples the boundary from this list instead of using "
++        "temporal_boundary. Chunk-wise causal training needs this: a rollout visits every chunk "
++        "position, so the model must be trained on all of them rather than one fixed prefix.",
++    )
+     temporal_boundary: int = Field(
+-        ...,
++        default=1,
+         ge=1,
+         description="Number of temporal units for prefix region. "
+         "For video: number of latent frames. For audio: number of audio latent timesteps.",
+     )
++    # --- context-noise / per-frame noise schedule (video only; all default off = clean-prefix teacher forcing)
++    context_noise_max: float = Field(
++        default=0.0, ge=0.0, le=1.0,
++        description="Upper bound of the per-sample context noise level sigma_c ~ U(0, max) applied to the clean "
++        "prefix (x=(1-s)x+s*eps, timestep=s). Exposes the model to imperfect history (MAGI-1 <=5%%, SkyReels-V2 "
++        "'slight noise', DFoT). 0 disables.",
++    )
++    context_noise_prob: float = Field(
++        default=0.0, ge=0.0, le=1.0,
++        description="Probability a sample gets context noise; the rest keep a clean prefix so clean-context "
++        "capability (and teacher-forced evaluation) stays in distribution.",
++    )
++    monotone_target_prob: float = Field(
++        default=0.0, ge=0.0, le=1.0,
++        description="Probability that the generated frames get non-decreasing per-frame noise levels from sigma_c "
++        "up to the sampled sigma (Diffusion-Forcing / MAGI-1 / SkyReels-V2 form) instead of one shared sigma. "
++        "Trains the shape pipelined (rolling) inference produces.",
++    )
++    full_monotone_prob: float = Field(
++        default=0.0, ge=0.0, le=1.0,
++        description="Probability (within monotone samples) that the prefix noise also ramps 0 -> sigma_c over the "
++        "prefix frames, i.e. a fully monotone schedule over the whole window.",
++    )
++    context_ramp_prob: float = Field(
++        default=0.0, ge=0.0, le=1.0,
++        description="Within context-noise samples: probability the prefix noise ramps from 0 at the oldest frame up "
++        "to sigma_c at the most recent frame (In-Context Forcing: recent clean frames leak detail and get copied; "
++        "noisier near context preserves dynamics). Otherwise the prefix gets a flat sigma_c.",
++    )
++    context_drop_prob: float = Field(
++        default=0.0, ge=0.0, le=1.0,
++        description="Probability the whole prefix is replaced by pure noise (sigma=1): history dropout, so the "
++        "model also learns to generate from white-box + text alone and History Guidance becomes available at "
++        "inference (DFoT).",
++    )
+ 
+ 
+ class SuffixConditionConfig(IntrinsicConditionBase):
+@@ -105,6 +154,11 @@ class ReferenceConditionConfig(BaseModel):
+     type: Literal["reference"] = "reference"
+     latents_dir: str = Field(..., description="Directory for reference latents")
+     probability: float = Field(default=1.0, ge=0.0, le=1.0, description="Probability of applying this condition")
++    time_offset: float = Field(default=0.0, description="Seconds added to this reference's temporal RoPE positions (e.g. -2.0 puts a "
++                               "reference IMAGE at a virtual time before the clip, so it is not read as the clip's frame 0)")
++    slot_role: Literal["control", "image"] | None = Field(default=None, description="Entity-slot binding: 'control' = the stick-figure "
++                               "video (per-token slot from the slot map), 'image' = an appearance reference owned by slot ref_slots[ref_index]")
++    ref_index: int | None = Field(default=None, description="For slot_role='image': which entry of the sample's ref_slots owns this reference")
+ 
+ 
+ # Discriminated union for condition configs
+@@ -140,6 +194,66 @@ class ModalityConfig(BaseModel):
+         default_factory=list,
+         description="List of conditions (e.g. first_frame, prefix, reference). Text conditioning is always applied.",
+     )
++    causal_block_size: int | None = Field(
++        default=None,
++        description=(
++            "Block-causal self-attention over latent frames: a block of this many frames attends only to "
++            "itself and earlier blocks (1 = frame-wise). None keeps full bidirectional attention. Video only."
++        ),
++    )
++    causal_first_block_frames: int | None = Field(
++        default=None,
++        description="Frames in causal block 0; defaults to causal_block_size.",
++    )
++    causal_reference_mode: Literal["aligned", "global"] = Field(
++        default="aligned",
++        description=(
++            "How reference (white-box) tokens are exposed under the causal mask. 'aligned': target block k sees "
++            "reference frames <= k only -- the live-engine geometry, no future white-box leaks into training. "
++            "'global': every target block sees the whole reference (only valid for offline, fully-known control)."
++        ),
++    )
++    causal_clean_copy: bool = Field(
++        default=False,
++        description=(
++            "Teacher forcing with a clean copy (Causal Forcing / Causal-rCM): the sequence becomes "
++            "[reference][clean target][noisy target]; noisy block k attends only clean blocks < k, reference "
++            "blocks <= k and itself, so every block trains 'generate one block from an all-clean history' -- "
++            "the streaming-inference geometry -- and one sample covers every history length. Requires "
++            "causal_block_size; mutually exclusive with intrinsic (prefix/first-frame) conditions. Video only."
++        ),
++    )
++    causal_max_frames: int | None = Field(
++        default=None,
++        description=(
++            "Crop target and reference latents to their first N latent frames before conditioning "
++            "(memory lever for causal_clean_copy: 3 copies of N frames instead of 2 copies of all frames)."
++        ),
++    )
++    causal_resample: bool = Field(
++        default=False,
++        description=(
++            "Resampling Forcing (arXiv 2512.15702) on top of causal_clean_copy: the clean copy is replaced by "
++            "the model's OWN one-step reconstructions, produced frame by frame with the KV cache so that each "
++            "frame is reconstructed from the already-degraded history (error accumulation as at inference). "
++            "Targets stay the ground truth. Requires the trainer to hand the model to the strategy."
++        ),
++    )
++    causal_resample_shift: float = Field(
++        default=0.6,
++        description="Shift applied to the logit-normal corruption level of the resampled frames; <1 biases toward low noise (paper: 0.6).",
++    )
++    causal_resample_prob: float = Field(
++        default=1.0,
++        description="Per-sample probability of resampling the history (else the exact clean copy is used).",
++    )
++    slots_dir: str | None = Field(default=None, description="Per-sample slot data (token_cover (F,H,W,K) float, ref_slots (R,) long) for binding")
++    slot_embedding: bool = Field(default=False, description="Add the model's slot embedding to image-reference tokens (their owner slot) and "
++                                 "to control tokens covered by a stick figure (that figure's slot) -- the shared vector links the two")
++    slot_gate: bool = Field(default=False, description="Bbox-gated attention: video tokens attend image reference k only inside the dilated "
++                            "bbox of slot k's stick figure in their latent frame; image references do not see each other")
++    slot_cover_thr: float = Field(default=0.02, description="Min token coverage for a token to belong to a slot")
++    slot_gate_dilate: float = Field(default=0.25, description="Bbox growth per side, as a fraction of its size (plus 1 token)")
+ 
+ 
+ class FlexibleStrategyConfig(TrainingStrategyConfigBase):
+@@ -204,6 +318,8 @@ class FlexibleStrategyConfig(TrainingStrategyConfigBase):
+                     sources[cond.latents_dir] = cond.latents_dir
+                 elif isinstance(cond, MaskConditionConfig):
+                     sources[cond.mask_dir] = cond.mask_dir
++            if getattr(modality_config, "slots_dir", None):
++                sources[modality_config.slots_dir] = modality_config.slots_dir
+ 
+         return sources
+ 
+@@ -256,6 +372,8 @@ class FlexibleStrategy(TrainingStrategy):
+         self.reference_spatial_scale_factor, self.reference_temporal_scale_factor = (
+             self._infer_reference_scale_factors_from_config()
+         )
++        self.model = None                # set by the trainer after accelerator.prepare (Resampling Forcing)
++        self._resample_calls = 0
+ 
+     def prepare_training_inputs(
+         self,
+@@ -358,6 +476,14 @@ class FlexibleStrategy(TrainingStrategy):
+         if modality_config is None:
+             return None
+ 
++        clean_copy = bool(getattr(modality_config, "causal_clean_copy", False)) and modality_key == "video"
++        self._causal_max_frames = getattr(modality_config, "causal_max_frames", None) if modality_key == "video" else None
++        if clean_copy:
++            if getattr(modality_config, "causal_block_size", None) is None:
++                raise ValueError("causal_clean_copy requires causal_block_size")
++            if any(isinstance(c, IntrinsicConditionBase) for c in modality_config.conditions):
++                raise ValueError("causal_clean_copy replaces prefix/first-frame conditions; remove them from conditions")
++
+         # Step 1: Load and patchify latents
+         data = self._patchify_latent_data(batch[f"{modality_key}_latents"], modality_key)
+         latents = data.latents
+@@ -402,6 +528,9 @@ class FlexibleStrategy(TrainingStrategy):
+             )
+ 
+         # Step 5: Apply conditions (intrinsic first, then extrinsic)
++        # The velocity target is (noise - latents) and does not depend on sigma, so the noise can be
++        # recovered exactly and re-used to re-noise tokens at other levels without changing the target.
++        noise = (targets + latents) if targets is not None else None
+         for cond in modality_config.conditions:
+             if isinstance(cond, IntrinsicConditionBase) and modality_config.is_generated:
+                 noisy_latents, timesteps, loss_mask = self._apply_intrinsic_condition(
+@@ -413,10 +542,22 @@ class FlexibleStrategy(TrainingStrategy):
+                     height=data.height,
+                     width=data.width,
+                     batch=batch,
++                    noise=noise,
+                 )
+ 
++        if clean_copy and modality_config.is_generated:
++            # [clean target][noisy target]: the clean copy is the history every noisy block conditions on.
++            # Same RoPE positions for both copies; the timestep (0 vs sigma) and the mask tell them apart.
++            # Loss stays on the noisy copy only (targets keep their length; the loss slices the tail).
++            noisy_latents = torch.cat([latents, noisy_latents], dim=1)
++            timesteps = torch.cat([torch.zeros_like(timesteps), timesteps], dim=1)
++            loss_mask = torch.cat([torch.zeros_like(loss_mask), loss_mask], dim=1)
++            positions = torch.cat([positions, positions], dim=2)
++
++        segs = [dict(kind="target", n=noisy_latents.shape[1], F=data.num_frames, H=data.height, W=data.width)]
+         for cond in modality_config.conditions:
+             if isinstance(cond, ReferenceConditionConfig):
++                n_before = noisy_latents.shape[1]
+                 noisy_latents, positions, timesteps, loss_mask, targets = self._apply_reference_condition(
+                     noisy_latents=noisy_latents,
+                     positions=positions,
+@@ -427,9 +568,27 @@ class FlexibleStrategy(TrainingStrategy):
+                     config=cond,
+                     modality_key=modality_key,
+                 )
++                if noisy_latents.shape[1] > n_before:                                 # prepended (the condition was applied)
++                    segs.insert(0, dict(kind="ref", cfg=cond, n=noisy_latents.shape[1] - n_before))
++
++        slot_ids = None; slot_mask = None
++        if modality_key == "video" and (getattr(modality_config, "slot_embedding", False) or getattr(modality_config, "slot_gate", False)):
++            slot_ids, slot_mask = self._slot_binding(modality_config, batch, segs, noisy_latents.device)
++            if not getattr(modality_config, "slot_embedding", False): slot_ids = None
++            if not getattr(modality_config, "slot_gate", False): slot_mask = None
++
++        if clean_copy and modality_config.is_generated and getattr(modality_config, "causal_resample", False):
++            noisy_latents = self._resample_clean_copy(
++                noisy_latents, positions, prompt_embeds, prompt_attention_mask,
++                num_frames=data.num_frames, tokens_per_frame=data.height * data.width, config=modality_config,
++            )
+ 
+         # Step 6: Build Modality
++        attention_mask = self._build_causal_attention_mask(modality_config, data, noisy_latents, modality_key)
++        if slot_mask is not None:
++            attention_mask = slot_mask if attention_mask is None else attention_mask * slot_mask.to(attention_mask.dtype)
+         modality = Modality(
++            slot_ids=slot_ids,
+             enabled=True,
+             latent=noisy_latents,
+             sigma=sigmas,
+@@ -437,6 +596,7 @@ class FlexibleStrategy(TrainingStrategy):
+             positions=positions,
+             context=prompt_embeds,
+             context_mask=prompt_attention_mask,
++            attention_mask=attention_mask,
+         )
+ 
+         return ModalityProcessingResult(
+@@ -445,6 +605,163 @@ class FlexibleStrategy(TrainingStrategy):
+             loss_mask=loss_mask,
+         )
+ 
++    @torch.no_grad()
++    def _resample_clean_copy(
++        self,
++        latents: Tensor,
++        positions: Tensor,
++        prompt_embeds: Tensor,
++        prompt_attention_mask: Tensor,
++        num_frames: int,
++        tokens_per_frame: int,
++        config: ModalityConfig,
++    ) -> Tensor:
++        """Resampling Forcing: replace the clean copy in ``[ref][clean][noisy]`` by the model's own one-step
++        reconstructions, produced autoregressively through the KV cache (ref frame f -> ref cache;
++        target frame f corrupted to a logit-normal level, one Euler step to x0 while attending
++        [ref <= f, resampled < f]; x0 committed to the target cache as the next frame's history).
++        Everything here is no-grad; the returned tensor is a drop-in replacement for the clean copy."""
++        if self.model is None:
++            raise RuntimeError("causal_resample needs strategy.model (the trainer sets it after prepare)")
++        from ltx_core.model.transformer.kv_cache import KVCacheView, LayerKVCache
++
++        half = num_frames * tokens_per_frame
++        if latents.shape[1] != 3 * half:
++            return latents                                    # reference condition skipped this batch: nothing to do
++        batch_size = latents.shape[0]
++        device, dtype = latents.device, latents.dtype
++        ref, clean = latents[:, :half], latents[:, half:2 * half]
++        pos_ref, pos_tgt = positions[:, :, :half], positions[:, :, half:2 * half]
++        model = self.model
++        num_blocks = len((model.module if hasattr(model, "module") else model).transformer_blocks) \
++            if hasattr(model.module if hasattr(model, "module") else model, "transformer_blocks") else None
++        if num_blocks is None:  # FSDP/peft wrappers: find the block list
++            for m in model.modules():
++                if hasattr(m, "transformer_blocks"):
++                    num_blocks = len(m.transformer_blocks); break
++        refc = [LayerKVCache() for _ in range(num_blocks)]
++        tgtc = [LayerKVCache() for _ in range(num_blocks)]
++        was_training = model.training
++        model.eval()
++
++        def fwd(x, s, pos, views, mask=None):
++            ts = s.view(batch_size, 1).expand(batch_size, x.shape[1]).to(dtype)
++            mod = Modality(enabled=True, sigma=s.to(dtype), latent=x, timesteps=ts, positions=pos,
++                           context=prompt_embeds, context_mask=prompt_attention_mask, kv_caches=views,
++                           attention_mask=mask)
++            v, _ = model(video=mod, audio=None, perturbations=None)
++            return v
++
++        zero = torch.zeros(batch_size, device=device, dtype=dtype)
++        use = torch.rand(batch_size, device=device) < config.causal_resample_prob
++        # Reference stream in ONE block-causal pass (K/V identical to committing it frame by frame, since
++        # reference frame f only ever sees reference frames <= f); target frame f then reads the reference
++        # cache with a read limit of (f+1) frames -> aligned, no future white-box.
++        ref_mask = build_block_causal_mask(num_frames, tokens_per_frame, 1, has_reference=False,
++                                           batch_size=batch_size, device=device, dtype=torch.float32)
++        fwd(ref, zero, pos_ref, [KVCacheView([refc[l]], refc[l]) for l in range(num_blocks)], mask=ref_mask)
++        out = []
++        for f in range(num_frames):
++            sl = slice(f * tokens_per_frame, (f + 1) * tokens_per_frame)
++            lim = [(f + 1) * tokens_per_frame, None]
++            # corruption level: logit-normal, shifted toward low noise
++            u = torch.sigmoid(torch.randn(batch_size, device=device))
++            sh = config.causal_resample_shift
++            t = (sh * u / (1 + (sh - 1) * u)).to(dtype)
++            x_clean = clean[:, sl]
++            x_t = (1 - t.view(-1, 1, 1)) * x_clean + t.view(-1, 1, 1) * torch.randn_like(x_clean)
++            v = fwd(x_t, t, pos_tgt[:, :, sl], [KVCacheView([refc[l], tgtc[l]], None, lim) for l in range(num_blocks)])
++            x0 = (x_t.float() - t.view(-1, 1, 1).float() * v.float()).to(dtype)
++            x0 = torch.where(use.view(-1, 1, 1), x0, x_clean)
++            fwd(x0, zero, pos_tgt[:, :, sl], [KVCacheView([refc[l], tgtc[l]], tgtc[l], lim) for l in range(num_blocks)])
++            out.append(x0)
++        if was_training:
++            model.train()
++        resampled = torch.cat(out, dim=1)
++        self._resample_calls += 1
++        if self._resample_calls == 1 or self._resample_calls % 100 == 0:
++            err = (resampled.float() - clean.float()).abs().mean().item()
++            ref_scale = clean.float().abs().mean().item()
++            logger.info("Resampling Forcing: call %d, shift=%.2f, mean|x~-x| = %.4f (mean|x| = %.4f, ratio %.3f)",
++                        self._resample_calls, config.causal_resample_shift, err, ref_scale, err / max(ref_scale, 1e-6))
++        return torch.cat([ref, resampled.detach(), latents[:, 2 * half:]], dim=1)
++
++    def _build_causal_attention_mask(
++        self,
++        modality_config: ModalityConfig,
++        data: LatentData,
++        latents: Tensor,
++        modality_key: str,
++    ) -> Tensor | None:
++        """Block-causal self-attention mask for the (possibly reference-prefixed) video sequence.
++
++        Returns None when the modality has no ``causal_block_size`` so the default path is untouched.
++        The sequence at this point is either ``[target]`` or ``[reference][target]`` (see
++        ``_apply_reference_condition``); which one is inferred from the token count rather than
++        from config, because the reference condition has a per-batch apply probability.
++        """
++        block_size = getattr(modality_config, "causal_block_size", None)
++        if block_size is None or modality_key != "video":
++            return None
++
++        tokens_per_frame = data.height * data.width
++        num_frames = data.num_frames
++        batch_size, seq_len, _ = latents.shape
++        half = num_frames * tokens_per_frame
++        clean_copy = bool(getattr(modality_config, "causal_clean_copy", False))
++        copies = seq_len // half if seq_len % half == 0 else -1
++        expected = (2, 3) if clean_copy else (1, 2)
++        if copies not in expected:
++            raise ValueError(
++                f"causal mask: sequence length {seq_len} is not {expected[0]} or {expected[1]} x F*TPF={half} "
++                f"(clean_copy={clean_copy}). Reference conditions with scale factors other than 1 are not "
++                "supported together with causal_block_size."
++            )
++        has_reference = copies == expected[1]
++
++        if clean_copy:
++            mask = build_clean_copy_tf_mask(
++                num_frames,
++                tokens_per_frame,
++                block_size,
++                has_reference=has_reference,
++                reference_mode=modality_config.causal_reference_mode,
++                first_block_frames=modality_config.causal_first_block_frames,
++                batch_size=batch_size,
++                device=latents.device,
++                dtype=torch.float32,
++            )
++            if not getattr(self, "_causal_mask_logged", False):
++                self._causal_mask_logged = True
++                logger.info(
++                    "Clean-copy teacher-forcing mask active: block_size=%s, reference=%s (%s), frames=%s, "
++                    "shape=%s, visible ratio=%.3f",
++                    block_size, has_reference, modality_config.causal_reference_mode, num_frames,
++                    tuple(mask.shape), mask.mean().item(),
++                )
++            return mask
++
++        mask = build_block_causal_mask(
++            num_frames,
++            tokens_per_frame,
++            block_size,
++            has_reference=has_reference,
++            reference_first=True,  # trainer prepends the reference
++            reference_mode=modality_config.causal_reference_mode,
++            first_block_frames=modality_config.causal_first_block_frames,
++            batch_size=batch_size,
++            device=latents.device,
++            dtype=torch.float32,
++        )
++        if not getattr(self, "_causal_mask_logged", False):
++            self._causal_mask_logged = True
++            logger.info(
++                "Block-causal attention mask active: block_size=%s, reference=%s (%s), shape=%s, visible ratio=%.3f",
++                block_size, has_reference, modality_config.causal_reference_mode, tuple(mask.shape),
++                mask.mean().item(),
++            )
++        return mask
++
+     @staticmethod
+     def _initialize_noisy_target(
+         latents: Tensor,
+@@ -471,6 +788,7 @@ class FlexibleStrategy(TrainingStrategy):
+         height: int,
+         width: int,
+         batch: dict[str, Any],
++        noise: Tensor | None = None,
+     ) -> tuple[Tensor, Tensor, Tensor]:
+         """Apply intrinsic conditioning using a binary mask.
+         For each token, the mask value determines conditioning strength:
+@@ -491,9 +809,11 @@ class FlexibleStrategy(TrainingStrategy):
+         if isinstance(config, FirstFrameConditionConfig):
+             mask = self._compute_temporal_mask(batch_size, seq_len, height, width, 1, False, device)
+         elif isinstance(config, PrefixConditionConfig):
+-            mask = self._compute_temporal_mask(
+-                batch_size, seq_len, height, width, config.temporal_boundary, False, device
+-            )
++            boundary = config.temporal_boundary
++            if config.temporal_boundary_choices:
++                boundary = int(random.choice(config.temporal_boundary_choices))
++            mask = self._compute_temporal_mask(batch_size, seq_len, height, width, boundary, False, device)
++            prefix_boundary = boundary
+         elif isinstance(config, SuffixConditionConfig):
+             mask = self._compute_temporal_mask(
+                 batch_size, seq_len, height, width, config.temporal_boundary, True, device
+@@ -518,8 +838,83 @@ class FlexibleStrategy(TrainingStrategy):
+         timesteps = (1 - mask) * timesteps
+         loss_mask = loss_mask & (mask == 0)
+ 
++        if (
++            isinstance(config, PrefixConditionConfig)
++            and noise is not None
++            and (config.context_noise_max > 0 or config.monotone_target_prob > 0 or config.context_drop_prob > 0)
++        ):
++            if not getattr(self, "_prefix_schedule_logged", False):
++                self._prefix_schedule_logged = True
++                logger.info(
++                    "Prefix noise schedule active: context_noise_max=%s prob=%s ramp=%s drop=%s | "
++                    "monotone_target_prob=%s full_monotone_prob=%s | boundary choices=%s",
++                    config.context_noise_max, config.context_noise_prob, config.context_ramp_prob,
++                    config.context_drop_prob, config.monotone_target_prob, config.full_monotone_prob,
++                    config.temporal_boundary_choices,
++                )
++            noisy_latents, timesteps = self._apply_prefix_noise_schedule(
++                clean_latents, noise, timesteps, mask, apply_per_sample, config, prefix_boundary, height * width
++            )
++
+         return noisy_latents, timesteps, loss_mask
+ 
++    @staticmethod
++    def _apply_prefix_noise_schedule(
++        clean: Tensor,
++        noise: Tensor,
++        timesteps: Tensor,
++        prefix_mask: Tensor,
++        applied: Tensor,
++        config: PrefixConditionConfig,
++        boundary: int,
++        tokens_per_frame: int,
++    ) -> tuple[Tensor, Tensor]:
++        """Per-token noise levels over the window; re-noises with the SAME noise so the velocity target holds.
++
++        Layout per sample (F latent frames, boundary b):
++            A  context noise:   frames < b get sigma_c ~ U(0, context_noise_max) w.p. context_noise_prob, else 0
++            B  monotone target: frames >= b get sigma_i non-decreasing from sigma_c to the sampled sigma
++                                w.p. monotone_target_prob, else all equal to sigma (unchanged behaviour)
++            B' full monotone:   within B, w.p. full_monotone_prob the prefix ramps 0 -> sigma_c as well
++        Loss masks are untouched (prefix stays excluded). Samples the prefix condition skipped keep their tensors.
++        """
++        batch_size, seq_len, _ = clean.shape
++        num_frames = seq_len // tokens_per_frame
++        device, dtype = clean.device, timesteps.dtype
++        # per-sample generated-frame sigma: every generated token carries it already
++        sigma = timesteps[:, -1].clone()                                       # (B,)
++        sig = timesteps.view(batch_size, num_frames, tokens_per_frame)[:, :, 0].clone()   # (B, F) per-frame levels
++
++        for b_idx in range(batch_size):
++            if not bool(applied[b_idx]):
++                continue
++            drop = config.context_drop_prob > 0 and torch.rand(()).item() < config.context_drop_prob
++            use_ctx = (not drop) and config.context_noise_max > 0 and torch.rand(()).item() < config.context_noise_prob
++            sigma_c = 1.0 if drop else (float(torch.rand(()).item() * config.context_noise_max) if use_ctx else 0.0)
++            use_mono = config.monotone_target_prob > 0 and torch.rand(()).item() < config.monotone_target_prob
++            full_mono = use_mono and torch.rand(()).item() < config.full_monotone_prob
++            ramp = use_ctx and torch.rand(()).item() < config.context_ramp_prob
++            n_gen = num_frames - boundary
++            if boundary > 0:
++                if (ramp or full_mono) and boundary > 1 and not drop:
++                    sig[b_idx, :boundary] = torch.linspace(0.0, sigma_c, boundary, device=device, dtype=dtype)
++                else:
++                    sig[b_idx, :boundary] = sigma_c
++            if use_mono and n_gen > 1:
++                top = float(sigma[b_idx]); base = 0.0 if drop else min(sigma_c, top)
++                u = torch.rand(n_gen, device=device).sort().values                # ascending in (0,1)
++                u[-1] = 1.0                                                       # last frame at the sampled sigma
++                sig[b_idx, boundary:] = (base + (top - base) * u).to(dtype)
++
++        sig_tok = sig.unsqueeze(-1).expand(batch_size, num_frames, tokens_per_frame).reshape(batch_size, seq_len)
++        s3 = sig_tok.unsqueeze(-1).to(clean.dtype)
++        noisy = (1 - s3) * clean + s3 * noise
++        # samples the prefix condition did not select keep exactly what they had
++        keep = applied.view(-1, 1, 1).to(clean.dtype)
++        noisy = keep * noisy + (1 - keep) * ((1 - timesteps.unsqueeze(-1).to(clean.dtype)) * clean + timesteps.unsqueeze(-1).to(clean.dtype) * noise)
++        timesteps = torch.where(applied.view(-1, 1), sig_tok, timesteps)
++        return noisy, timesteps
++
+     @staticmethod
+     def _compute_temporal_mask(
+         batch_size: int,
+@@ -582,6 +977,11 @@ class FlexibleStrategy(TrainingStrategy):
+             width = latent_data["width"][0].item()
+             fps = latent_data.get("fps")
+             fps = fps[0].item() if fps is not None else DEFAULT_FPS
++            max_frames = getattr(self, "_causal_max_frames", None)
++            if max_frames is not None and num_frames > max_frames:
++                # latents are [B, C, F, H, W]; keep the first frames (the causal VAE makes any prefix a valid clip)
++                latents = latents[:, :, :max_frames]
++                num_frames = max_frames
+             latents = self._video_patchifier.patchify(latents)
+         else:
+             num_frames = latent_data.get("num_frames", [latents.shape[2]])[0]
+@@ -594,6 +994,52 @@ class FlexibleStrategy(TrainingStrategy):
+ 
+         return LatentData(latents=latents, num_frames=num_frames, height=height, width=width, fps=fps)
+ 
++    def _slot_binding(self, mc, batch: dict[str, Any], segs: list[dict], device) -> tuple[Tensor, Tensor]:
++        """Per-token slot ids and the bbox-gated attention mask for the sequence [refs...][target] described by ``segs``.
++        Control / target tokens are laid out (F, H, W) like the slot map's token_cover; an image reference belongs to
++        ref_slots[ref_index] of its sample. Slot 0 = no slot."""
++        S = batch[mc.slots_dir]; cover = S["token_cover"].to(device).float()          # (B, F, H, W, K), slot k = index + 1
++        ref_slots = S["ref_slots"].to(device).long()                                  # (B, R)
++        B, F_, H_, W_, K = cover.shape; tgt = next(sg for sg in segs if sg["kind"] == "target")   # last in training, first at inference
++        if (F_, H_, W_) != (tgt["F"], tgt["H"], tgt["W"]):
++            raise ValueError(f"slot map {(F_, H_, W_)} does not match the latent grid {(tgt['F'], tgt['H'], tgt['W'])}")
++        mx, arg = cover.max(-1)
++        grid_ids = torch.where(mx > mc.slot_cover_thr, arg + 1, torch.zeros_like(arg)).reshape(B, -1)   # (B, F*H*W)
++        # gate: per (sample, slot, frame) the dilated bbox of that slot's figure, as a token map (B, K, F*H*W)
++        occ = cover > mc.slot_cover_thr                                               # (B, F, H, W, K)
++        hh = torch.arange(H_, device=device).view(1, 1, H_, 1); ww = torch.arange(W_, device=device).view(1, 1, 1, W_)
++        allow = torch.zeros(B, K, F_, H_, W_, dtype=torch.bool, device=device)
++        for k in range(K):
++            o = occ[..., k]; rows = o.any(3); cols = o.any(2)                          # (B, F, H), (B, F, W)
++            big = torch.tensor(10 ** 6, device=device)
++            r0 = torch.where(rows, hh.view(1, 1, H_).expand_as(rows), big).min(-1).values; r1 = torch.where(rows, hh.view(1, 1, H_).expand_as(rows), -big).max(-1).values
++            c0 = torch.where(cols, ww.view(1, 1, W_).expand_as(cols), big).min(-1).values; c1 = torch.where(cols, ww.view(1, 1, W_).expand_as(cols), -big).max(-1).values
++            dh = ((r1 - r0 + 1).clamp(min=0) * mc.slot_gate_dilate).long() + 1; dw = ((c1 - c0 + 1).clamp(min=0) * mc.slot_gate_dilate).long() + 1
++            r0, r1, c0, c1 = r0 - dh, r1 + dh, c0 - dw, c1 + dw                          # empty frame: r0 > r1 stays empty
++            allow[:, k] = ((hh >= r0[..., None, None]) & (hh <= r1[..., None, None]) & (ww >= c0[..., None, None]) & (ww <= c1[..., None, None]))
++        allow = allow.reshape(B, K, -1)
++        ids, spans, pos = [], [], 0
++        for sg in segs:
++            n = sg["n"]; role = getattr(sg.get("cfg"), "slot_role", None) if sg["kind"] == "ref" else "target"
++            if role in ("control", "target"):
++                ids.append(grid_ids if role == "control" else torch.zeros_like(grid_ids)); spans.append((role, pos, n, None))
++            elif role == "image":
++                k_ = ref_slots[:, sg["cfg"].ref_index]; ids.append(k_[:, None].expand(B, n)); spans.append(("image", pos, n, k_))
++            else:
++                ids.append(torch.zeros(B, n, dtype=torch.long, device=device)); spans.append(("other", pos, n, None))
++            pos += n
++        slot_ids = torch.cat(ids, 1)
++        T = pos; mask = torch.ones(B, T, T, dtype=torch.bfloat16, device=device)
++        grid_spans = [(a, n) for r, a, n, _ in spans if r in ("control", "target")]
++        imgs = [(a, n, k_) for r, a, n, k_ in spans if r == "image"]
++        for a, n, k_ in imgs:
++            gate = allow[torch.arange(B, device=device), (k_ - 1).clamp(min=0)] & (k_ > 0)[:, None]   # (B, F*H*W)
++            for ga, gn in grid_spans:
++                mask[:, ga:ga + gn, a:a + n] = gate[:, :, None].to(mask.dtype)
++            for a2, n2, _ in imgs:
++                if a2 != a: mask[:, a:a + n, a2:a2 + n2] = 0
++        return slot_ids, mask
++
+     def _apply_reference_condition(
+         self,
+         noisy_latents: Tensor,
+@@ -657,6 +1103,8 @@ class FlexibleStrategy(TrainingStrategy):
+                     cond_positions[:, 1, ...] *= spatial_sf
+                     cond_positions[:, 2, ...] *= spatial_sf
+ 
++        if modality_key == "video" and getattr(config, "time_offset", 0.0):
++            cond_positions = cond_positions.clone(); cond_positions[:, 0, ...] = cond_positions[:, 0, ...] + float(config.time_offset)
+         # Condition tokens: clean, timestep=0, no loss
+         cond_timesteps = torch.zeros(batch_size, cond_seq_len, device=device, dtype=dtype)
+         cond_loss_mask = torch.zeros(batch_size, cond_seq_len, dtype=torch.bool, device=device)
+diff --git a/packages/ltx-trainer/src/ltx_trainer/validation_runner.py b/packages/ltx-trainer/src/ltx_trainer/validation_runner.py
+index a5f3fb0..23e8c99 100644
+--- a/packages/ltx-trainer/src/ltx_trainer/validation_runner.py
++++ b/packages/ltx-trainer/src/ltx_trainer/validation_runner.py
+@@ -1,3 +1,5 @@
++# NOTICE: this file was modified (or added) by the Wizard authors, 2026, for reference-image slot binding,
++# KV-cached causal attention and proxy-video conditioning. Distributed under the LTX-2.x Community License.
+ """Self-contained validation runner for LTX-2 training.
+ Encapsulates all validation concerns: model loading, embedding caching,
+ conditioning media encoding, sample generation (denoising + decoding),
+@@ -72,7 +74,13 @@ from ltx_trainer.model_loader import (
+     resolve_video_vae_path,
+ )
+ from ltx_trainer.progress import SamplingContext, TrainingProgress
++import dataclasses
++import logging
++
++from ltx_trainer.causal_mask import build_block_causal_mask
+ from ltx_trainer.utils import open_image_as_srgb, save_image
++
++_causal_log = logging.getLogger(__name__)
+ from ltx_trainer.video_utils import read_video, save_video
+ 
+ if TYPE_CHECKING:
+@@ -871,6 +879,8 @@ class ValidationRunner:
+     ) -> tuple[LatentState | None, LatentState | None]:
+         """Run the Euler denoising loop with CFG/STG, handling frozen modalities."""
+         cfg = self._config
++        if video_state is not None and getattr(cfg, "causal_block_size", None) is not None:
++            video_state = self._with_causal_attention_mask(video_state, cfg, device)
+         scheduler = LTX2Scheduler()
+         sigmas = scheduler.execute(steps=cfg.inference_steps).to(device).float()
+         stepper = EulerDiffusionStep()
+@@ -890,7 +900,11 @@ class ValidationRunner:
+                 video_present=video_present,
+             )
+         )
+-        transformer_dtype = next(transformer.parameters()).dtype
++        # DDP and FSDP wrappers do not forward attribute lookups such as num_blocks,
++        # so read those off the inner module -- but keep calling forward through the
++        # wrapper. Bypassing FSDP skips its all-gather and leaves parameters sharded.
++        inner = getattr(transformer, "module", transformer)
++        transformer_dtype = next(inner.parameters()).dtype
+ 
+         x0_model = X0Model(transformer)
+ 
+@@ -929,7 +943,7 @@ class ValidationRunner:
+                 video_enabled=video is not None and video_guider.do_perturbed_generation(),
+                 audio_enabled=audio is not None and audio_guider.do_perturbed_generation(),
+                 stg_blocks=cfg.stg_blocks,
+-                num_blocks=transformer.num_blocks,
++                num_blocks=inner.num_blocks,
+                 device=device,
+                 dtype=transformer_dtype,
+             )
+@@ -941,7 +955,7 @@ class ValidationRunner:
+                 audio is not None and audio_guider.do_isolated_modality_generation()
+             ):
+                 mod_perturbation_config = self._build_modality_perturbation_config(
+-                    transformer.num_blocks, device, transformer_dtype
++                    inner.num_blocks, device, transformer_dtype
+                 )
+                 mod_video, mod_audio = x0_model(video=video, audio=audio, perturbations=mod_perturbation_config)
+ 
+@@ -1257,6 +1271,47 @@ class ValidationRunner:
+             modality_scale=modality_scale,
+         )
+ 
++    @staticmethod
++    def _with_causal_attention_mask(state: LatentState, cfg: "ValidationConfig", device: torch.device) -> LatentState:
++        """Attach the block-causal mask the model was trained with to the video LatentState.
++
++        The runner appends reference tokens *after* the target (``_apply_conditions``), the
++        opposite of the trainer, hence ``reference_first=False``. Whether a reference is present
++        is inferred from the token count. Geometry constants (32x spatial, 8x temporal) match the
++        LTX video VAE used everywhere else in this runner.
++        """
++        width, height, pixel_frames = cfg.video_dims
++        tokens_per_frame = (height // 32) * (width // 32)
++        num_frames = (pixel_frames - 1) // 8 + 1
++        seq_len = state.latent.shape[1]
++        if seq_len == num_frames * tokens_per_frame:
++            has_reference = False
++        elif seq_len == 2 * num_frames * tokens_per_frame:
++            has_reference = True
++        else:
++            raise ValueError(
++                f"causal mask: validation sequence length {seq_len} is neither F*TPF="
++                f"{num_frames * tokens_per_frame} nor 2*F*TPF={2 * num_frames * tokens_per_frame}; "
++                "reference scale factors other than 1 are not supported with causal_block_size."
++            )
++        mask = build_block_causal_mask(
++            num_frames,
++            tokens_per_frame,
++            cfg.causal_block_size,
++            has_reference=has_reference,
++            reference_first=False,
++            reference_mode=cfg.causal_reference_mode,
++            first_block_frames=cfg.causal_first_block_frames,
++            batch_size=state.latent.shape[0],
++            device=device,
++            dtype=torch.float32,
++        )
++        _causal_log.info(
++            "Validation: block-causal mask active (block_size=%s, reference=%s, shape=%s, visible ratio=%.3f)",
++            cfg.causal_block_size, has_reference, tuple(mask.shape), mask.mean().item(),
++        )
++        return dataclasses.replace(state, attention_mask=mask)
++
+     @staticmethod
+     def _modality_from_latent_state(state: LatentState, context: Tensor, sigma: Tensor) -> Modality:
+         """Build a Modality object from a LatentState, text context, and sigma."""
+@@ -1270,6 +1325,7 @@ class ValidationRunner:
+             positions=state.positions,
+             context=context,
+             context_mask=None,
++            attention_mask=state.attention_mask,
+             keyframes_mask=state.keyframes_mask,
+         )
+ 
