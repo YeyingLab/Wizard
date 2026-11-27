@@ -46,8 +46,8 @@ alone takes about 29 GB on top of the model. With `seed` from `case.json` the re
 | Case | What happens |
 |---|---|
 | `ltx_summon_fire_duel` | A wizard on a beach summons a fire spirit (`ref_a.png`) from a circle in the sand and fights it |
-| `ltx_world_edit_lift` | The sand under the wizard rises into a stone platform and lifts him up (geometry edit in the proxy) |
-| `ltx_statue_griffin` | A stone griffin statue (`ref_a.png`) in a ruined church comes alive, beats its wings and flies over the wizard |
+| `ltx_sea_tornado` | On a headland the camera turns to the sea; the wizard points his staff and three waterspouts rise from the sea (geometry edit in the proxy) |
+| `ltx_transform_gargoyle_griffin` | In front of a castle a witch summons a gargoyle (`ref_a.png`), stone steps rise beside her, and the gargoyle turns into a griffin (`ref_b.png`): its reference switches from slot 2 to slot 3 mid-clip |
 
 A case directory holds `proxy.mp4` (the condition video), `first_frame.png`, `ref_a.png` / `ref_b.png` (reference images;
 `ref_slots` in `case.json` says which skeleton slot each one belongs to, `0` = unused), `slots.npz` (token coverage of
