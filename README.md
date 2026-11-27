@@ -89,8 +89,8 @@ export WAN_CKPT=$PWD/checkpoints/Wan2.2-TI2V-5B      # the VAE, T5 and tokenizer
 ```bash
 # the real-time model and five ready-made cases (first frame, proxy video, reference images, our outputs)
 huggingface-cli download yuzhewu207/wizard --repo-type dataset \
-    --include "weights/causal_dmd/ema_step300.safetensors" "examples/*" --local-dir hf_wizard
-W=hf_wizard/weights/causal_dmd/ema_step300.safetensors
+    --include "weights/causal_dmd/ema_step400.safetensors" "examples/*" --local-dir hf_wizard
+W=hf_wizard/weights/causal_dmd/ema_step400.safetensors
 
 # real-time 2-step causal student: an 8 s duel with a character already in the first frame, and an 8 s world edit
 C=hf_wizard/examples/duel_bull_character
@@ -115,14 +115,14 @@ DiT checkpoints fine-tuned from Wan2.2-TI2V-5B, in the `weights/` folder of
 
 | Checkpoint | Stage | Sampling |
 |---|---|---|
-| `causal_dmd/ema_step300.safetensors` | 4 · real-time causal student (DMD of `causal_cd`, 300 steps, interim) | `causal` / `world`, 2 steps |
+| `causal_dmd/ema_step400.safetensors` | 4 · real-time causal student (DMD of `causal_cd`, step 400 of 500) | `causal` / `world`, 2 steps |
 | `causal_dmd/ema_step480.safetensors` | 4 · DMD student from an earlier run of the chain, kept for comparison | `causal` / `world`, 2 steps |
 | `causal_cd/ema_step10000.safetensors` | 3 · consistency-distilled causal student | `causal` / `world`, 2 steps |
 | `causal_teacher/dit_step11000.safetensors` | 2 · causal teacher | teacher of stage 3 |
 | `bidirectional/dit_step35000.safetensors` | 1 · bidirectional teacher, all data incl. world-edit clips | `bidirectional`, 30 steps, CFG 3 |
 
 `causal_cd` is the consistency student of the released chain (stage 3 run from `causal_teacher` with the scripts below).
-`causal_dmd/ema_step300` is the DMD student of this `causal_cd` after 300 of 500 planned steps; the final checkpoint will replace it. `ema_step480` comes from an earlier run of the chain.
+`causal_dmd/ema_step400` is the DMD student of this `causal_cd` at step 400 of a 500-step run, chosen over steps 300–500 by evaluation. `ema_step480` comes from an earlier run of the chain.
 
 **Other base models.** The approach is not tied to Wan: the visual proxy, the reference binding and the training recipe
 carry over to other video backbones. We also trained it on [LTX-2.5](https://huggingface.co/Lightricks/LTX-2.5) (22B)
